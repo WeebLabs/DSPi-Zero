@@ -35,6 +35,8 @@ typedef struct {
     uint32_t smi_ctl, smi_div, in_use, refused;     // phase 2: the SMI clock and who owns PLLA
     int32_t trim_ppb;                               // phase 5
     uint32_t trims;
+    uint32_t wd_events, wd_restores, wd_fallbacks;  // phase 6 watchdog
+    uint32_t wd_seen[4];    // CTRL, FRAC, PER, CM_PLLA (bit 31: FLOCKA) at the last mismatch
 } pll_out_status_t;
 
 // For the SMI: selects a row now and returns true once plla_per runs at it. A move within the same PER
@@ -43,7 +45,10 @@ typedef struct {
 bool pll_out_select(uint32_t row);
 uint32_t pll_out_smi_row(uint32_t freq, uint32_t *divi);
 void pll_out_set_in_use(bool on);
-void pll_out_trim(int32_t ppb);     // live trim of every row's multiplier, kept across family moves                   // the SMI runs from plla_per: bench moves that hold it are refused
+void pll_out_trim(int32_t ppb);
+enum { PLL_WD_OK, PLL_WD_RESTORED, PLL_WD_FALLBACK };
+uint32_t pll_out_watchdog(void);    // main loop; on PLL_WD_FALLBACK the caller moves the SMI to PLLD
+void pll_out_sabotage(uint32_t ms); // bench: rewrite PLLA as the firmware would, once or for ms     // live trim of every row's multiplier, kept across family moves                   // the SMI runs from plla_per: bench moves that hold it are refused
 
 // Settling capture: the SMI clock counted in back-to-back 1 ms windows, with PLLA moved to a row at the
 // start of window PLL_CAPTURE_PRE. Bench only: it blocks the main loop for the whole capture.

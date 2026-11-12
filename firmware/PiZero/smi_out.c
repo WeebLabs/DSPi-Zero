@@ -70,7 +70,7 @@ static uint32_t last_off_words;     // DMA offset in the ring at the last read, 
 static uint32_t word_rem;           // words read past the last whole frame
 static uint32_t last_us;
 static uint32_t l_refresh_at;
-static uint32_t source = SMI_SRC_PLLD;     // the preferred source; PLLD is the fallback
+static uint32_t source = SMI_SRC_PLLA;     // the preferred source; PLLD is the fallback (PLLA plan phase 6)
 
 static uint32_t micros(void) {
     return REG(0x3F003004u);

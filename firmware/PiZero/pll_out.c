@@ -107,6 +107,17 @@ static uint32_t trimmed(const row_t *r) {
     return (uint32_t)(base + (d >= 0 ? d + 500000000 : d - 500000000) / 1000000000);
 }
 
+// True when PLLA's registers hold the active row (with the trim) and its channel runs. Something else,
+// such as the firmware, may have rewritten them since we did.
+static bool registers_match(void) {
+    if (!active) {
+        return false;
+    }
+    uint32_t m = trimmed(active);
+    return (rd(A2W_PLLA_CTRL) & NDIV_MASK) == m >> 20 && (rd(A2W_PLLA_FRAC) & FRAC_MASK) == (m & FRAC_MASK) &&
+           (rd(A2W_PLLA_PER) & 0x1FFu) == active->per_div && !(rd(CM_PLLA) & HOLDPER) && (REG(CM_LOCK) & FLOCKA);
+}
+
 // A move between rows with the same PER divider, with the channel already running, is made live: the
 // PLL slews to the new rate and the channel keeps its clock. Anything else holds the channel.
 static bool needs_hold(uint32_t row) {
@@ -227,7 +238,7 @@ bool pll_out_select(uint32_t row) {
     if (row == PLL_ROW_FIRMWARE || row >= PLL_ROW_COUNT) {
         return false;
     }
-    if (active == &rows[row] && st.state == PLL_LOCKED) {
+    if (active == &rows[row] && st.state == PLL_LOCKED && registers_match()) {
         return true;
     }
     retune(row);
@@ -250,7 +261,62 @@ void pll_out_trim(int32_t ppb) {
     if (active && st.state == PLL_LOCKED) {
         uint32_t m = trimmed(active);
         write_multiplier(m >> 20, m & FRAC_MASK);
+        write_us = micros();
     }
+}
+
+// Phase 6 watchdog, once a second while the SMI runs from PLLA. It reads back the multiplier, the PER
+// divider, HOLDPER and FLOCKA. On a mismatch it counts the event and restores our values once; if a
+// mismatch comes back before ten clean checks have passed, it asks the caller to fall back to PLLD.
+static uint32_t wd_last_us, wd_strikes, wd_clean;
+static uint32_t sabotage_until, sabotage_last;
+
+uint32_t pll_out_watchdog(void) {
+    uint32_t now = micros();
+    if (now - wd_last_us < 1000000u) {
+        return PLL_WD_OK;
+    }
+    wd_last_us = now;
+    if (!in_use || !active || st.state != PLL_LOCKED || now - write_us < 100000u) {
+        return PLL_WD_OK;   // not ours, or a move or trim is still settling
+    }
+    uint32_t m = trimmed(active);
+    uint32_t ctrl = rd(A2W_PLLA_CTRL), frac = rd(A2W_PLLA_FRAC), per = rd(A2W_PLLA_PER), cm = rd(CM_PLLA);
+    uint32_t lock = REG(CM_LOCK) & FLOCKA;
+    if (registers_match()) {
+        if (++wd_clean >= 10u) {
+            wd_strikes = 0;
+        }
+        return PLL_WD_OK;
+    }
+    st.wd_events++;
+    st.wd_seen[0] = ctrl;
+    st.wd_seen[1] = frac;
+    st.wd_seen[2] = per;
+    st.wd_seen[3] = cm | (lock ? 1u << 31 : 0);
+    wd_clean = 0;
+    if (wd_strikes++ == 0) {
+        write_multiplier(m >> 20, m & FRAC_MASK);
+        wr(A2W_PLLA_PER, active->per_div);
+        uint32_t c = rd(CM_PLLA) & ~LOAD_BITS;
+        wr(CM_PLLA, c | LOADPER);
+        wr(CM_PLLA, c & ~HOLDPER);
+        write_us = micros();
+        st.wd_restores++;
+        return PLL_WD_RESTORED;
+    }
+    wd_strikes = 0;
+    st.wd_fallbacks++;
+    return PLL_WD_FALLBACK;
+}
+
+// Bench: stands in for the firmware rewriting PLLA, by writing its boot multiplier behind our back, once
+// (ms 0) or every 100 ms for ms milliseconds.
+void pll_out_sabotage(uint32_t ms) {
+    save_firmware_values();
+    write_multiplier(st.fw_ctrl & NDIV_MASK, st.fw_frac & FRAC_MASK);
+    sabotage_last = micros();
+    sabotage_until = ms ? sabotage_last + ms * 1000u : 0;
 }
 
 uint32_t pll_out_smi_row(uint32_t freq, uint32_t *divi) {
@@ -351,6 +417,15 @@ void pll_out_pcm_clock(uint32_t src, uint32_t divi) {
 }
 
 void pll_out_poll(void) {
+    if (sabotage_until) {
+        uint32_t now = micros();
+        if ((int32_t)(now - sabotage_until) >= 0) {
+            sabotage_until = 0;
+        } else if (now - sabotage_last >= 100000u) {
+            write_multiplier(st.fw_ctrl & NDIV_MASK, st.fw_frac & FRAC_MASK);
+            sabotage_last = now;
+        }
+    }
     uint32_t row = pending_row;
     if (row != 0xFFFFFFFFu && st.state != PLL_WAITING) {
         pending_row = 0xFFFFFFFFu;

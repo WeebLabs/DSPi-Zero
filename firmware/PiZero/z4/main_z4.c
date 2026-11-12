@@ -177,6 +177,10 @@ typedef struct {
     int32_t fb_servo_q16;           // fill servo term
     int32_t fb_fill_err_q16;        // filtered slot 0 fill error, in 48-frame buckets
     uint32_t fb_updates;
+    uint32_t smi_source;            // version 9: 1 when the SMI runs from PLLA, 0 on PLLD
+    uint32_t pll_wd_events;         // PLLA watchdog: mismatches seen, restores, fallbacks to PLLD
+    uint32_t pll_wd_restores;
+    uint32_t pll_wd_fallbacks;
 } z4_stats_t;
 
 int8_t dcd_dwc2_iso_parity(uint8_t dir, uint8_t epnum);
@@ -507,7 +511,7 @@ typedef struct {
 // Wire layout read by the bench tools: version 1 fields unchanged, the DSPi block appended.
 _Static_assert(offsetof(u2_reply_t, dspi) == 116, "0x4F reply: DSPi block offset");
 _Static_assert(offsetof(z4_stats_t, peaks) == 28 && offsetof(z4_stats_t, slot0_fill) == 64, "0x4F reply layout");
-_Static_assert(sizeof(u2_reply_t) == 372, "0x4F reply size");
+_Static_assert(sizeof(u2_reply_t) == 388, "0x4F reply size");
 
 static void fill_dspi_stats(z4_stats_t *z) {
     memset(z, 0, sizeof(*z));
@@ -557,6 +561,12 @@ static void fill_dspi_stats(z4_stats_t *z) {
     z->fb_servo_q16 = fb_ctrl.servo_q16;
     z->fb_fill_err_q16 = fb_ctrl.fill_error_filtered;
     z->fb_updates = fb_ctrl.diag_updates;
+    static pll_out_status_t ps;
+    pll_out_status(&ps);
+    z->smi_source = smi_out_source();
+    z->pll_wd_events = ps.wd_events;
+    z->pll_wd_restores = ps.wd_restores;
+    z->pll_wd_fallbacks = ps.wd_fallbacks;
 }
 
 bool dspi_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req);
@@ -637,7 +647,7 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     // PCM clock from source wIndex >> 12 with integer divider wIndex & 0xFFF, 3 starts the frequency
     // counter on mux wIndex & 0xFF for (wIndex >> 8) x 192000 oscillator cycles, 4 puts the SMI on PLLA
     // (wIndex 1) or PLLD (0), 5 captures settling into row wIndex & 0xFF over wIndex >> 8 windows, 6 trims PLLA by
-    // (int16)wIndex x 0.01 ppm. IN returns
+    // (int16)wIndex x 0.01 ppm, 7 rewrites PLLA behind the watchdog's back (once, or for wIndex ms). IN returns
     // the status, or with wValue 1 the settling capture.
     if (bench && req->bRequest == 0x46) {
         static pll_out_status_t pst;
@@ -663,6 +673,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
             pll_out_capture_request(req->wIndex & 0xFFu, req->wIndex >> 8);
         } else if (req->wValue == 6) {
             pll_out_trim((int32_t)(int16_t)req->wIndex * 10);     // wIndex in units of 0.01 ppm
+        } else if (req->wValue == 7) {
+            pll_out_sabotage(req->wIndex);    // bench: rewrite PLLA as the firmware would, for wIndex ms
         } else if (req->wValue == 4) {
             smi_source_request = req->wIndex;
         } else {
@@ -741,7 +753,7 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
             return true;
         }
         reply.magic = U2_STATS_MAGIC;
-        reply.version = 8;
+        reply.version = 9;
         reply.uptime_ms = board_micros() / 1000u;
         reply.rate = current_rate;
         reply.alt = current_alt;
@@ -1193,6 +1205,9 @@ int main(void) {
     for (;;) {
         sensors_refresh();
         pll_out_poll();
+        if (pll_out_watchdog() == PLL_WD_FALLBACK) {
+            smi_out_set_source(SMI_SRC_PLLD);   // PLLA keeps being rewritten: stay on PLLD until reboot
+        }
         usb_watch();
         if (smi_source_request != 0xFFFFFFFFu) {
             smi_out_set_source(smi_source_request);

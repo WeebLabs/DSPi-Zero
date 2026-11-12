@@ -23,7 +23,7 @@ PREAMBLES = {"X": 0b11001001, "Y": 0b01101001, "Z": 0b00111001}
 
 
 def smi_stats(dev):
-    raw = bytes(dev.ctrl_transfer(0xC0, 0x4F, 0, 0, 372, timeout=500))
+    raw = bytes(dev.ctrl_transfer(0xC0, 0x4F, 0, 0, 388, timeout=500))
     s = read_stats(dev, raw)    # the same reply, so frames and uptime are sampled together
     if s["version"] < 7:
         raise SystemExit(f"FAIL: stats version {s['version']}, need 7 (load the SMI pizero_z4.img)")
@@ -31,6 +31,9 @@ def smi_stats(dev):
     fb = struct.unpack_from("<3I2iI", raw, 348) if len(raw) >= 372 else None
     if fb:
         d.update(fb_sent=fb[0], fb_rate_iir=fb[1], fb_rate_long=fb[2], fb_servo=fb[3], fb_fill_err=fb[4])
+    if len(raw) >= 388:     # version 9: SMI clock source and the PLLA watchdog
+        src, ev, rs, fbk = struct.unpack_from("<4I", raw, 372)
+        d.update(smi_source=src, pll_wd_events=ev, pll_wd_restores=rs, pll_wd_fallbacks=fbk)
     d["s"] = s
     return d
 

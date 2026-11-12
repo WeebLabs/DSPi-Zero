@@ -428,3 +428,29 @@ Every reading is within the counter's resolution of the command (0.07 ppm over 4
 - **Trimming off an integer:** the test ran on the B rows, which become fractional as soon as they are trimmed. That is the spur case section 8 warns about, and it can only be judged with an instrument (phase 4). A tracking loop should use the A rows.
 
 **Verdict.** Phase 5 passes on frequency, lock and the stream. Receiver lock is outstanding. Phase 6 (PLLA as the boot default, with the watchdog and PLLD fallback) is next.
+
+## 13. Phase 6 results (2026-11-12)
+
+Code:
+- **Boot default.** The SMI's preferred source in `smi_out.c` is now PLLA. Its first clock setup happens in `shim_smi_start()`, after the ARM clock request and before interrupts are enabled. That setup is PLLA's first start: it holds the PER channel, retunes, waits for lock and releases the channel. If PLLA does not lock, `clock_set()` falls back to PLLD with MASH as before.
+- **`pll_out_select()`** now checks PLLA's registers before trusting a row it already holds. Without that check, returning to PLLA after the firmware had rewritten it left the SMI 4.7 % fast.
+- **Watchdog.** `pll_out_watchdog()` runs from the main loop once a second while the SMI runs from PLLA, skipping the first 100 ms after a move or trim. It reads back NDIV, FRAC, the PER divider, HOLDPER and FLOCKA.
+  - On a mismatch it records what it saw and restores our values once.
+  - If a mismatch comes back before ten clean checks have passed, the main loop moves the SMI to PLLD, where it stays until reboot or until bench request `0x46` op 4 asks for PLLA again.
+  - Stats version 9 (`0x4F`, 388 bytes) reports the source in use and the watchdog's events, restores and fallbacks.
+- **Bench request** `0x46` op 7 stands in for the firmware by rewriting PLLA to its boot multiplier, once or every 100 ms for a given time. `tools/pll_failover.py` drives it, and `tools/pll_soak.py` runs the soak.
+
+**Boots.** Ten reboots through the USB loader each reset the whole SoC, so the VideoCore firmware set PLLA to 2400 MHz again every time. Every boot came up with the SMI on PLLA, row b48 locked, and the SMI clock at exactly 36.864000 MHz. These were not power cycles, but the firmware starts from scratch either way.
+
+**Forced fallback, with a tone playing.**
+- **One rewrite:** the watchdog counted one event, restored PLLA within a second, and the SMI clock read exact again.
+- **Rewrites every 100 ms for 5 s:** one restore, then a fallback to PLLD within the next second. All four slots decoded on PLLD.
+- **Asking for PLLA again:** the SMI returned to PLLA with an exact clock.
+
+**One-hour soak.** A rate switch every minute cycled 44.1, 48 and 96 kHz, with DSPi Console and its spectrum analyzer polling throughout. In each minute's 48 s window, which leaves out the stream restart, there were no slot underruns, ring drops, USB underruns or late compositions. The SMI stayed on PLLA with an exact clock in all 60 minutes, and the watchdog saw no event.
+
+**Documentation.** Bring-up section 20's 44.1 kHz prediction is corrected to +76.6 ppm, and section 19 notes the PLLA clock. Port plan section 4 now says HDMI audio is paced by HSM, not by the pixel clock.
+
+**Not covered.** No HDMI hot-plug or thermal throttling episode happened during the soak; the watchdog is the protection against both. Phase 4 (jitter) needs an instrument, and the receiver-lock part of phase 5 needs a receiver.
+
+**Verdict.** Phase 6 passes. PLLA with integer dividers is the audio clock, with a watchdog and a PLLD fallback.

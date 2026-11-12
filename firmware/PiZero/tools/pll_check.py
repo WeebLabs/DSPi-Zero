@@ -19,7 +19,8 @@ MUX_PCM, MUX_SMI = 23, 27
 SRC_PLLD, SRC_PLLA = 6, 4
 FIELDS = ("magic row state retunes lock_us unlock_first_us unlock_reads lock_reads lock_lost count count_mux "
           "count_osc count_seq count_state count_us ctrl frac ana1 per core cm_plla cm_lock v3d_ctl v3d_div "
-          "pcm_ctl pcm_div fw_ctrl fw_frac fw_per fw_cm_plla smi_ctl smi_div in_use refused trim_ppb trims").split()
+          "pcm_ctl pcm_div fw_ctrl fw_frac fw_per fw_cm_plla smi_ctl smi_div in_use refused trim_ppb trims wd_events wd_restores wd_fallbacks wd_ctrl wd_frac wd_per "
+          "wd_cm").split()
 # name: (row index, NDIV, FRAC, PER divider, PCM divider giving 768 fs at 48 or 44.1 kHz)
 ROWS = {"fw": (0, None, None, None, None), "a48": (1, 61, 0x70A3D, 8, 8), "a44": (2, 56, 0x72B02, 8, 8),
         "b48": (3, 48, 0, 5, 10), "b44": (4, 44, 0x1999A, 5, 10)}

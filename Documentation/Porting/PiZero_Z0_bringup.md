@@ -591,6 +591,7 @@ These came from a temporary test request that streamed a pattern ring with the t
 ### How it works
 
 - **One stream.** `smi_out.c` streams 16-bit words at 256 fs: 12.288 MHz at 48 kHz, 11.2896 MHz at 44.1 kHz and 24.576 MHz at 96 kHz. A 1 + 1 + 1 cycle runs from 500 MHz PLLD through the fractional divider. The 1/256 divider step leaves the rate up to about 70 ppm off nominal (48,003 Hz at 48 kHz), which the USB feedback absorbs.
+  *Update (2026-11-12): the SMI clock now comes from PLLA with an integer divider and no fractional dither, exact at every rate, with this PLLD path kept as the fallback. See `PiZero_PLLA_plan.md`.*
 - **Ring and interrupts.** A DMA loop runs over a 128-frame ring of 256-word frames, with an interrupt every 16 frames. The interrupt refreshes `L` and calls the composer, which keeps the ring 64 frames ahead of the DMA. The ring is cached, and each composed block is cleaned out to SDRAM for the DMA.
 - **Composer.** `pico_shim.c` turns each slot ring into its pin's bits. An S/PDIF cell lasts 2 words and an I2S bit clock 4, at every rate. Slot n is always bit n, so the four slots merge with NEON shift-and-insert, 16 words at a time, and the clocks are ORed in.
 - **Ring contents as on the RP2350.** The S/PDIF ring writes now encode exactly as `pico_audio_spdif_multi`'s software encoder: its lookup table, preambles, channel status (with the sample-rate byte) and parity. Each ring holds NRZI cells, where a 1 toggles the line, and the composer turns them into levels with a running XOR. I2S words are stored as `pico_audio_i2s_multi` stores them: `(sample << 8) | 0x01`. The earlier stand-in stored raw values, so section 18's PCM output was 48 dB too quiet.
@@ -656,7 +657,9 @@ The feedback now comes from DSPi's own controller (`usb_feedback_controller.c`, 
 |---|---|---|---|---|
 | 48 kHz | +64.8 to +65.8 ppm | +64 ppm | -4 frames | 0, or one packet |
 | 96 kHz | +65.5 to +65.8 ppm | +64 ppm | -6 frames | 0 to 384 bytes |
-| 44.1 kHz | +78.7 ppm | +101 ppm predicted, unexplained | -0.5 frames | 0 |
+| 44.1 kHz | +78.7 ppm | +76.6 ppm | -0.5 frames | 0 |
+
+*Correction (2026-11-12): the 44.1 kHz prediction first read +101 ppm, from an arithmetic slip (500 / 33.868 instead of 500 / 33.8688). The right figure is +76.6 ppm, so all three rates leave the same 1 to 2 ppm residual, which is the Pi's crystal against the host. The SMI now runs from PLLA with an integer divider, and the residual alone remains (`PiZero_PLLA_plan.md` sections 10 to 13).*
 
 There were no slot underruns, ring drops, host gaps or late compositions, and the restart cycles passed. Latency is now DSPi's fill target (192 frames, 4 ms at 48 kHz) plus the composer's lead of about 1.3 ms, down from about 17 ms.
 
