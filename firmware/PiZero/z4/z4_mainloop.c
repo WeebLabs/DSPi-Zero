@@ -247,6 +247,70 @@ static void complete_pipeline_reset(void) {
     adat_output_resync();
 }
 
+// main.c's drain_and_disable_outputs() and enable_outputs_in_sync(), for the S/PDIF prefill: outputs stop
+// and their rings empty, then all start together once slot 0 holds real audio at its target fill.
+static void drain_and_disable_outputs(void) {
+    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+        teardown_output_slot(i);
+    }
+    adat_output_stream_stop();
+}
+
+static void enable_outputs_in_sync(void) {
+    audio_spdif_instance_t *spdif_sync[NUM_SPDIF_INSTANCES];
+    audio_i2s_instance_t *i2s_sync[NUM_SPDIF_INSTANCES];
+    uint spdif_count = 0, i2s_count = 0;
+    uint32_t flags = save_and_disable_interrupts();
+    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+        if (output_types[i] == OUTPUT_TYPE_I2S) {
+            if (i2s_instance_ptrs[i] && i2s_instance_ptrs[i]->ring) {
+                i2s_sync[i2s_count++] = i2s_instance_ptrs[i];
+            }
+        } else if (spdif_instance_ptrs[i] && spdif_instance_ptrs[i]->ring) {
+            spdif_sync[spdif_count++] = spdif_instance_ptrs[i];
+        }
+    }
+    if (spdif_count) {
+        audio_spdif_enable_sync(spdif_sync, spdif_count);
+    }
+    if (i2s_count) {
+        audio_i2s_enable_sync(i2s_sync, i2s_count);
+    }
+    restore_interrupts(flags);
+    i2s_input_resync();
+    adat_output_resync();
+}
+
+// main.c's S/PDIF part of input_service_handshakes(): on lock, drain the outputs and prefill them from
+// the input; on loss, mute. The clock servo then runs every pass, gating its own tick.
+static bool spdif_prefilling;
+
+static void service_spdif_input(void) {
+    if (!input_source_is_spdif(active_input_source)) {
+        spdif_prefilling = false;
+        return;
+    }
+    SpdifInputState rx_state = spdif_input_get_state();
+    if (rx_state == SPDIF_INPUT_LOCKED && preset_loading && !spdif_prefilling && dac_hw_mute_hold_elapsed()) {
+        spdif_input_check_rate_change();
+        drain_and_disable_outputs();
+        preset_loading = false;
+        preset_mute_counter = 0;
+        spdif_prefilling = true;
+        spdif_input_discard_queued();
+    }
+    if (spdif_prefilling && slot_fill_at_target(0)) {
+        enable_outputs_in_sync();
+        spdif_prefilling = false;
+        dac_hw_mute_release();
+    }
+    if (rx_state == SPDIF_INPUT_RELOCKING && !preset_loading && !spdif_prefilling) {
+        prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+        pipeline_reset_cpu_metering();
+    }
+    spdif_input_update_clock_servo();
+}
+
 // main.c's flash write bracket. The receivers are stand-ins, so there is nothing to suspend.
 static void prepare_flash_write_operation(void) {
     z4_service_producer();
@@ -1170,6 +1234,7 @@ void z4_dspi_service(void) {
     busy = true;
 
     dac_hw_mute_tick();
+    service_spdif_input();
     lg_sound_sync_tick();
     siggen_service();
     rta_service();

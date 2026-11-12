@@ -19,3 +19,6 @@ void irq_set_pending(uint num);
 #define PICO_HIGHEST_IRQ_PRIORITY 0x00
 #define PICO_DEFAULT_IRQ_PRIORITY 0x80
 #define PICO_LOWEST_IRQ_PRIORITY  0xff
+
+#define DMA_IRQ_0 10u     // RP2350 numbering, only ever passed back to the calls above
+#define DMA_IRQ_1 11u

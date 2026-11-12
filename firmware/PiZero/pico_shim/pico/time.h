@@ -36,3 +36,9 @@ static inline void sleep_us(uint64_t us) {
 static inline void sleep_ms(uint32_t ms) {
     busy_wait_ms(ms);
 }
+
+// Alarm pools exist only to be named in configurations (pico_spdif_rx's); nothing schedules on them.
+typedef struct alarm_pool alarm_pool_t;
+static inline alarm_pool_t *alarm_pool_get_default(void) {
+    return 0;
+}

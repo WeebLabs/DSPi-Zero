@@ -35,6 +35,7 @@
 #include "output_latency.h"
 #include "pdm_generator.h"
 #include "siggen.h"
+#include "spdif_input.h"
 #include "usb_audio.h"
 
 #include "z4.h"
@@ -43,6 +44,7 @@
 #include "pcm_out.h"
 #include "smi_out.h"
 #include "pcm_rx.h"
+#include "spdif_rx_pi.h"
 #include "clk_dump.h"
 #include "pll_out.h"
 #include "device/dcd.h"
@@ -593,6 +595,7 @@ static void sensors_refresh(void) {
     sensor_temp_cc = (int32_t)(mbox_temperature_mc() + 5u) / 10;
 }
 
+static volatile uint32_t spdif_monitor_request = 0xFFFFFFFFu;    // bench 0x44, run from the main loop
 static volatile uint32_t smi_source_request = 0xFFFFFFFFu;     // bench 0x46 op 4, run from the main loop
 
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req) {
@@ -643,6 +646,20 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
             return tud_control_xfer(rhport, req, &copy, req->wLength < sizeof(copy) ? req->wLength : sizeof(copy));
         }
         return true;
+    }
+    // 0x44: the S/PDIF receiver's capture and decoder (spdif_rx_pi.c). IN returns its status; OUT wValue 1
+    // runs it as a bench monitor while DSPi's input is something else, and 0 stops the monitor.
+    if (bench && req->bRequest == 0x44) {
+        static spdif_rx_pi_status_t rs;
+        if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+        }
+        if (in) {
+            spdif_rx_pi_status(&rs);
+            return tud_control_xfer(rhport, req, &rs, req->wLength < sizeof(rs) ? req->wLength : sizeof(rs));
+        }
+        spdif_monitor_request = req->wValue ? 1u : 0u;
+        return tud_control_status(rhport, req);
     }
     // 0x47: PCM receive rate (port plan section 6). OUT runs a capture of wValue ms from the main loop, at
     // the PCM clock bench request 0x46 op 2 set; IN returns the result.
@@ -1149,6 +1166,9 @@ void z4_service_producer(void) {
     tud_task();
     consume_task();
     input_delivery_mark();
+    if (input_source_is_spdif(active_input_source)) {
+        spdif_input_poll();
+    }
     siggen_pump();
     output_rings_idle_pump();
     notify_drain(0);
@@ -1224,6 +1244,12 @@ int main(void) {
             smi_out_set_source(SMI_SRC_PLLD);   // PLLA keeps being rewritten: stay on PLLD until reboot
         }
         usb_watch();
+        if (spdif_monitor_request != 0xFFFFFFFFu) {
+            if (!input_source_is_spdif(active_input_source)) {
+                spdif_rx_pi_monitor(spdif_monitor_request != 0u);
+            }
+            spdif_monitor_request = 0xFFFFFFFFu;
+        }
         if (smi_source_request != 0xFFFFFFFFu) {
             smi_out_set_source(smi_source_request);
             smi_source_request = 0xFFFFFFFFu;

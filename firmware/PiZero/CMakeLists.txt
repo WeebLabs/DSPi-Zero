@@ -233,6 +233,8 @@ if(PIZERO_BOARD STREQUAL "zero2")
         pdm_generator.c
         audio_input.c
         adat_output.c
+        spdif_input.c
+        input_servo.c
         notify.c
         bg_job.c
         vendor_commands.c
@@ -268,6 +270,7 @@ if(PIZERO_BOARD STREQUAL "zero2")
         ${DSPI_DIR}
         ${PICO_EXTRAS_DIR}/pico_audio_spdif_multi/include
         ${PICO_EXTRAS_DIR}/pico_audio_i2s_multi/include
+        ${PICO_EXTRAS_DIR}/pico_spdif_rx
     )
     # This also makes vendor requests report WIRE_PLATFORM_RP2350 (1), so an unpatched DSPi Console
     # connects. Temporary, until the Zero gets its own platform ID.
@@ -312,7 +315,7 @@ if(PIZERO_BOARD STREQUAL "zero2")
         tud_descriptor_string_cb=dspi_tud_descriptor_string_cb
     )
 
-    add_executable(pizero_z4 ${PLATFORM_SRC} irq.c mem_ops.c pcm_out.c pcm_rx.c pll_out.c smi_out.c z4/main_z4.c z4/clk_dump.c z4/z4_prof.c z4/z4_mainloop.c z4/z4_globals.c z4/dspi_standins.c pico_shim/pico_shim.c uac2/usb_descriptors.c)
+    add_executable(pizero_z4 ${PLATFORM_SRC} irq.c mem_ops.c pcm_out.c pcm_rx.c pll_out.c smi_out.c z4/main_z4.c z4/clk_dump.c z4/z4_prof.c z4/z4_mainloop.c z4/z4_globals.c z4/dspi_standins.c z4/spdif_rx_pi.c z4/soft_vcxo_pi.c spdif_decode.c pico_shim/pico_shim.c uac2/usb_descriptors.c)
     target_include_directories(pizero_z4 BEFORE PRIVATE ${CMAKE_CURRENT_LIST_DIR}/uac2 ${CMAKE_CURRENT_LIST_DIR}/pico_shim)
     target_link_libraries(pizero_z4 PRIVATE dspi_z4 tinyusb_uac2)
     target_link_options(pizero_z4 PRIVATE -Wl,--wrap=dcd_event_handler)    # USB event accounting, main_z4.c

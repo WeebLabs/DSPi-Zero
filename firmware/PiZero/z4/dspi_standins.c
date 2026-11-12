@@ -1,7 +1,7 @@
-// Stand-ins for the DSPi modules that drive RP2350-only hardware and so are not compiled here:
-// flash_clkdiv.c (QSPI flash access), spdif_input.c, i2s_input.c and adat_input.c (PIO receivers).
-// Each keeps the module's public API. The receivers start and stop but never see a signal, which is
-// what an RP2350 DSPi with nothing plugged into the input reports.
+// Stand-ins for DSPi modules that drive RP2350-only hardware: flash_clkdiv.c (QSPI flash access), and the
+// i2s_input.c and adat_input.c PIO receivers. Each keeps the module's public API. The receivers start
+// and stop but never see a signal, as on an RP2350 DSPi with nothing plugged in. spdif_input.c is not
+// stood in for: it is compiled, on spdif_rx_pi.c.
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,58 +28,6 @@ void dspi_flash_range_erase(uint32_t flash_offs, size_t count) {
 
 void dspi_flash_range_program(uint32_t flash_offs, const uint8_t *data, size_t count) {
     flash_range_program(flash_offs, data, count);
-}
-
-// ---------------------------------------------------------------------------------------------------
-// spdif_input.c: started means waiting for lock, which never comes
-
-static SpdifInputState spdif_state = SPDIF_INPUT_INACTIVE;
-static uint8_t spdif_lock_count, spdif_loss_count;
-
-void spdif_input_init(void) {
-    spdif_state = SPDIF_INPUT_INACTIVE;
-}
-
-void spdif_input_start(void) {
-    if (spdif_state == SPDIF_INPUT_INACTIVE) {
-        spdif_state = SPDIF_INPUT_ACQUIRING;
-    }
-}
-
-void spdif_input_stop(void) {
-    spdif_state = SPDIF_INPUT_INACTIVE;
-}
-
-uint32_t spdif_input_poll(void) {
-    return 0;
-}
-
-void spdif_input_discard_queued(void) {}
-
-void spdif_input_update_clock_servo(void) {}
-
-SpdifInputState spdif_input_get_state(void) {
-    return spdif_state;
-}
-
-uint32_t spdif_input_get_sample_rate(void) {
-    return 0;
-}
-
-void spdif_input_get_status(SpdifRxStatusPacket *out) {
-    memset(out, 0, sizeof(*out));
-    out->state = (uint8_t)spdif_state;
-    out->input_source = active_input_source;
-    out->lock_count = spdif_lock_count;
-    out->loss_count = spdif_loss_count;
-}
-
-void spdif_input_get_channel_status(uint8_t *out_24_bytes) {
-    memset(out_24_bytes, 0, 24);
-}
-
-bool spdif_input_check_rate_change(void) {
-    return false;
 }
 
 // ---------------------------------------------------------------------------------------------------

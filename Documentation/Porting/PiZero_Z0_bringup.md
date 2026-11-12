@@ -712,3 +712,32 @@ DSPi's ADAT output now runs, on GPIO 16 (SMI SD8, header pin 36). As with the ot
 
 **Not covered.** No ADAT receiver has decoded the pin. ADAT's 96 kHz mode (S/MUX) is not offered, because DSPi does not offer it on the RP2350 either.
 
+## 23. S/PDIF input on the PCM block
+
+*Added: 2026-11-12*
+
+DSPi's S/PDIF input now runs on the Pi. `spdif_input.c` and `input_servo.c` are compiled unchanged. Underneath them, `z4/spdif_rx_pi.c` provides the API of the RP2350's receive library (`pico_spdif_rx`), and `z4/soft_vcxo_pi.c` turns the servo's VCXO command into a PLLA trim.
+
+**Wiring.** The source's optical receiver module is powered from 3.3 V, and its output goes to GPIO 20 (PCM_DIN, header pin 38). DSPi's stored S/PDIF input pin is bookkeeping only, as the output pins are.
+
+**Capture.** The PCM block is clock and frame master, with two 32-bit receive channels filling each 64-bit frame, so every PCM clock is one sample of the line. The clock is PLLD / 4 = 125 MHz, which input tracking never moves. Only GPIO 20 is routed; the clock and frame stay inside the block. A DMA loop fills a 128 KB ring of eight chunks of about 1 ms, and each chunk's interrupt decodes it.
+
+**Decoding** (`spdif_decode.c`, tested on the Mac by `tests/spdif_decode_test.c`).
+- **Finding the stream:** the decoder times level changes, measures the cell from the longest runs, and looks for two preambles 64 cells apart. Their spacing gives the cell length precisely.
+- **Tracking:** it reads each time slot from two samples at its cell centres; a 1 is a level change between them. It re-anchors on a slot's leading edge every 8 cells, using one count-leading-zeros on a 32-sample window. Every slot must start with a level change, and every subframe with a valid preamble, or the stream counts as lost and the search starts again.
+- **Mac test:** subframes decode exactly at 44.1, 48 and 96 kHz, clean and with ±0.2 cells of edge jitter (16 ns at 96 kHz). At 62.5 MHz sampling, 96 kHz with that jitter fails, so the sampling stays at 125 MHz.
+
+**Library behaviour.** Blocks of 384 subframes start at a B preamble. Four aligned blocks at one rate make the receiver STABLE and call DSPi's lock callback. A misaligned block, a rate change, or 10 ms without a block loses the lock. The FIFO is DSPi's input capture arena. Block timestamps come from each block's sample position, referred to the chunk interrupt's system-timer time, so the servo's long-window rate uses the crystal's time base, as on the RP2350.
+
+**Main loop.** `z4_mainloop.c` gained `main.c`'s S/PDIF handshake: on lock, the outputs drain and are prefilled from the input; on loss, the output mutes. The servo runs every pass, and `z4_service_producer()` delivers the input.
+
+**Result with a real source** (`tools/spdif_in_check.py --source`, 48 kHz from an optical source).
+- **Lock:** DSPi locked within 0.1 s, at a measured 47998.08 Hz.
+- **Two minutes of music:** 95996 subframes a second, no decode or parity errors, no output underruns or late compositions. The audio reached the outputs.
+- **Tracking:** DSPi's servo held the PLLA trim at -43.2 to -43.9 ppm, following the source's clock. The trim returned to exactly 0 on the switch back to USB.
+- **No signal:** with nothing connected, the receiver reports no signal, DSPi reports acquiring, and USB playback is clean afterwards.
+
+**Cost.** The decoding interrupt takes 13.9% of the CPU at 48 kHz. About 4.8 points of that is reading 15.6 MB/s of samples, which is spent even with no signal. DSPi Console's CPU figure does not include it, because it counts only DSPi's own block processing. A first version that handled every level change took 27.5%.
+
+**Not covered.** The source was 48 kHz only. 44.1 and 96 kHz from a real source, unplugging and replugging, and a source changing rate are untested. 96 kHz should roughly double the decoding cost. ADAT input is not started.
+
