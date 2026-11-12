@@ -574,8 +574,10 @@ On most modules XSMT must be high (unmuted) and FMT low (I2S). Many boards strap
 | Slot 4 (outputs 7-8) | 11 | SD3 | 23 |
 | I2S BCK | 12 | SD4 | 32 |
 | I2S LRCLK | 13 | SD5 | 33 |
+| ADAT (added in section 22) | 16 | SD8 | 36 |
+| MCK (GPCLK0, not the SMI) | 4 | | 7 |
 
-A slot's pin carries S/PDIF or I2S data according to its type. BCK and LRCLK run while any slot is I2S. The UART (GPIO 14/15) and PCM pins (GPIO 18 to 21) are untouched. DSPi's stored pin numbers are ignored, as they were for the PCM block. MCK and the ADAT output are not done yet.
+A slot's pin carries S/PDIF or I2S data according to its type. BCK and LRCLK run while any slot is I2S. The UART (GPIO 14/15) and PCM pins (GPIO 18 to 21) are untouched. DSPi's stored pin numbers are ignored, as they were for the PCM block. MCK was added later (`PiZero_PLLA_plan.md` section 14), and so was the ADAT output (section 22).
 
 ### What the bench showed about the SMI
 
@@ -628,7 +630,6 @@ macOS reads the value in samples per data-endpoint service interval: 1 ms here, 
 
 - A listening test through a DAC or S/PDIF receiver on these pins.
 - A logic-analyser look at pin-to-pin skew and the clock's jitter.
-- MCK, the ADAT output, and which pins they take.
 - Windows' reading of the feedback value.
 - Moving the composer to a second core, if the load matters at 96 kHz.
 
@@ -688,3 +689,26 @@ A first attempt ran the whole disable with interrupts off. That deadlocked the m
 **Diagnostics left in for now.** These come out or become bench-only once the fix has had more time.
 - The `0x45` accounting.
 - A main-loop hang watch (`usb_watch()` in `z4/main_z4.c`). If SETUPs keep arriving with no EP0 completion for 3 s, if a USB interrupt is pending with no handler running for 150 ms, or (once armed by a `0x45` read with wValue 1) if EP0 completes nothing for 8 s, it snapshots the controller and the last eight SETUPs, then disconnects and reconnects so the record can be read.
+
+## 22. ADAT output on the SMI
+
+*Added: 2026-11-12*
+
+DSPi's ADAT output now runs, on GPIO 16 (SMI SD8, header pin 36). As with the other slots, DSPi's stored ADAT pin is bookkeeping only. As on the RP2350, the pin is claimed only while ADAT is enabled. While DSPi has the stream stopped, at 96 kHz for example, the pin is held low, and disabling ADAT returns it to an input.
+
+**How it works.** `adat_output.c` is compiled unchanged. On the RP2350 it encodes each frame into 256 NRZI line levels in a ring, and a DMA channel feeds them to a PIO state machine at 256 fs. One ADAT bit lasts exactly one SMI word, so the composer can play that ring directly.
+- **Start and stop.** The shim watches `pio_sm_set_enabled()` for pio1 SM 1, which is ADAT's state machine. On enable it takes the ring from the read address and length given to DMA channel 13, and the frame from the output clock.
+- **Composing.** Each SMI frame plays one ring frame on bit 8, MSB first. The composer stores the slot byte and the ADAT byte of each word together with one interleaving store (`vst2q_u8`).
+- **Progress.** After each batch, the composer moves DMA channel 13's read address on, so DSPi's own lead and overflow accounting works as on the RP2350.
+- **Main loop.** `z4_mainloop.c` gained the ADAT calls from `main.c`: `adat_output_resync()` at the end of `complete_pipeline_reset()` and at boot, `adat_output_task()` every pass, and `adat_output_release_moving_pin()` in a pin change. DSPi stops ADAT above 48 kHz, as it does on the RP2350.
+
+**Test.** `tools/adat_check.py` puts slot 0 on I2S, enables ADAT with DSPi's `REQ_SET_ADAT_ENABLE` and plays a 1 kHz tone straight to the Pi. It decodes ADAT frames and slot 0's I2S words from the same composed SMI frames.
+- **48 kHz:** every frame had a correct sync pattern and forced 1 bits. Channels 1 and 2 carried the tone, and channels 3 to 8 were silent, which matches the routing. DSPi holds ADAT 96 frames behind slot 0, which is exactly two periods of the tone, and channel 1 equalled the I2S word frame for frame.
+- **44.1 kHz:** the amplitude matched the I2S word (83849 against 83848), and the lag read 7.80 frames modulo one period, which is 96 frames as expected.
+- **96 kHz:** DSPi reported ADAT inactive with `rate_ok` 0, and the pin was held low. Returning to 48 kHz restarted it, again matching frame for frame. With ADAT disabled, GPIO 16 was an input again.
+- **Stream health:** over 60 s each at 48 and 44.1 kHz, there were no underruns, ring drops, late compositions, ADAT resyncs or slips. `usb_health.py` shows no hang recoveries.
+
+**Cost.** The composer takes 1185 cycles a frame with ADAT running, against 900 without it (885 before this change). The extra is about 1.4% of the 1 GHz CPU at 48 kHz.
+
+**Not covered.** No ADAT receiver has decoded the pin. ADAT's 96 kHz mode (S/MUX) is not offered, because DSPi does not offer it on the RP2350 either.
+

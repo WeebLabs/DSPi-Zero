@@ -38,6 +38,10 @@ void smi_out_set_rate(uint32_t freq);
 enum { SMI_SRC_PLLD, SMI_SRC_PLLA };
 void smi_out_set_source(uint32_t src);
 uint32_t smi_out_source(void);
+// MCK on GPIO 4 (GPCLK0) at mult (128 or 256) times the SMI's rate, locked to the SMI clock; 0 stops it.
+void smi_out_mck(uint32_t mult);
+// Hands a GPIO to the SMI (its SD bit in the stream) or returns it to an input, for pins used part-time.
+void smi_out_pin(uint32_t gpio, bool on);
 uint32_t smi_out_frames(void);      // frames the DMA has read; safe from any context
 uint32_t smi_out_composed(void);    // frames composed so far, the reader position of the slot rings
 uint32_t smi_out_words2(void);      // frames the DMA has read, times 2, to 1/128 frame: I2S ring words

@@ -204,8 +204,8 @@ static void teardown_output_slot(int slot) {
     }
 }
 
-// main.c's complete_pipeline_reset(). The ADAT output is never started here (adat_output_resync()
-// is left out), so its stream never runs whatever its configuration says.
+// main.c's complete_pipeline_reset(). The ADAT output restarts last, against slot 0, as in main.c; the
+// SMI composer carries its stream.
 static void complete_pipeline_reset(void) {
     audio_spdif_instance_t *spdif_sync[NUM_SPDIF_INSTANCES];
     audio_i2s_instance_t *i2s_sync[NUM_SPDIF_INSTANCES];
@@ -244,7 +244,7 @@ static void complete_pipeline_reset(void) {
         dac_hw_mute_release();
     }
     i2s_input_resync();
-    adat_output_config_dirty = false;
+    adat_output_resync();
 }
 
 // main.c's flash write bracket. The receivers are stand-ins, so there is nothing to suspend.
@@ -271,8 +271,20 @@ static void complete_flash_write_operation_full(void) {
 // ---------------------------------------------------------------------------------------------------
 // Output slot types and pins, from main.c's process_type_switches() and process_pin_changes()
 
+// MCK runs only when locally clocked and something uses I2S (an output slot or the input), from main.c.
+static void apply_mck_policy(void) {
+    bool any_i2s = active_input_source == INPUT_SOURCE_I2S;
+    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+        if (output_types[i] == OUTPUT_TYPE_I2S) {
+            any_i2s = true;
+        }
+    }
+    audio_i2s_mck_apply_state(i2s_mck_pin, !i2s_slave_mode_active() && any_i2s && i2s_mck_enabled,
+                              audio_state.freq, i2s_mck_multiplier);
+}
+
 // Slot rebuild for a type change or a changed I2S clock role: the lowest-index I2S slot is clock master,
-// unless I2S runs as clock slave. Pins, MCK and PDM only move as bookkeeping here.
+// unless I2S runs as clock slave. Pins and PDM only move as bookkeeping here.
 static bool process_type_switches(uint8_t change_mask, const uint8_t new_types[]) {
     if (change_mask == 0) {
         return false;
@@ -373,6 +385,7 @@ static bool process_type_switches(uint8_t change_mask, const uint8_t new_types[]
         }
     }
     memcpy(output_types, target_types, NUM_SPDIF_INSTANCES);
+    apply_mck_policy();
     complete_pipeline_reset();
     output_type_switch_in_progress = false;
     __dmb();
@@ -399,6 +412,7 @@ static bool apply_restored_outputs(const uint8_t old_types[]) {
         return true;
     }
     memcpy(output_types, new_types, NUM_SPDIF_INSTANCES);
+    apply_mck_policy();
     return false;
 }
 
@@ -410,6 +424,7 @@ static void process_pin_changes(uint8_t mask) {
     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
         teardown_output_slot(i);
     }
+    adat_output_release_moving_pin();
     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
         if (!(mask & (1u << i))) {
             continue;
@@ -438,6 +453,9 @@ static void apply_nominal_output_rate(uint32_t rate) {
         if (output_types[i] != OUTPUT_TYPE_I2S && inst && inst->ring) {
             audio_spdif_apply_pio_frequency(inst, rate);
         }
+    }
+    if (i2s_mck_enabled) {
+        audio_i2s_mck_update_frequency(rate, i2s_mck_multiplier);
     }
 }
 
@@ -993,8 +1011,8 @@ static void service_outputs_and_bulk(void) {
         __dmb();
         process_type_switches(mask, (const uint8_t *)pending_output_types);
     }
-    // The ADAT output is never started here (see complete_pipeline_reset), so a configuration change
-    // only needs the muted restart main.c does around it.
+    // ADAT: silence top-up every pass, and a configuration change through a muted restart, as in main.c.
+    adat_output_task();
     if (adat_output_config_dirty && pipeline_reset_ready()) {
         prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
         complete_pipeline_reset();
@@ -1047,6 +1065,7 @@ static void service_input_config(void) {
             if (live) {
                 rebuild_i2s_output_clocking();
             }
+            apply_mck_policy();
             uint8_t wire_mode = i2s_clock_mode;
             notify_param_write(offsetof(WireBulkParams, input_config.i2s_clock_mode), 1, &wire_mode);
         }
@@ -1112,6 +1131,7 @@ static void service_input_config(void) {
                 if (i2s_clock_mode != I2S_CLOCK_MODE_SLAVE && i2s_input_rate != audio_state.freq) {
                     perform_rate_change(i2s_input_rate);
                 }
+                apply_mck_policy();     // main.c's i2s_input_bringup_prefill() starts MCK for a master input
                 i2s_input_start(true);
             } else if (new_source == INPUT_SOURCE_ADAT) {
                 if (adat_clock_mode == ADAT_CLOCK_MODE_MASTER && i2s_input_rate != audio_state.freq) {
@@ -1216,6 +1236,7 @@ void z4_dspi_init(void) {
         preset_get_dac_hw_mute(&hw);
         dac_hw_mute_init(&hw);
     }
+    adat_output_resync();    // if the loaded configuration enables it
 
     loudness_recompute_table(loudness_ref_spl, loudness_intensity_pct, 48000.0f);
     if (loudness_enabled && loudness_active_table) {

@@ -37,6 +37,8 @@ typedef struct {
     uint32_t trims;
     uint32_t wd_events, wd_restores, wd_fallbacks;  // phase 6 watchdog
     uint32_t wd_seen[4];    // CTRL, FRAC, PER, CM_PLLA (bit 31: FLOCKA) at the last mismatch
+    uint32_t gp0_ctl, gp0_div;  // MCK on GPCLK0
+    uint32_t gpfsel0, gpfsel1;  // GPIO 0-19 functions: MCK on GPIO 4, ADAT on GPIO 16
 } pll_out_status_t;
 
 // For the SMI: selects a row now and returns true once plla_per runs at it. A move within the same PER

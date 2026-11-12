@@ -37,6 +37,9 @@
 #define CM_KILL (1u << 5)
 #define CM_BUSY (1u << 7)
 #define CM_MASH1 (1u << 9)
+#define CM_GP0CTL 0x3F101070u
+#define CM_GP0DIV 0x3F101074u
+#define GPFSEL0 0x3F200000u
 
 #define DMA_BASE 0x3F007000u
 #define DMA_ENABLE 0x3F007FF0u
@@ -71,6 +74,7 @@ static uint32_t word_rem;           // words read past the last whole frame
 static uint32_t last_us;
 static uint32_t l_refresh_at;
 static uint32_t source = SMI_SRC_PLLA;     // the preferred source; PLLD is the fallback (PLLA plan phase 6)
+static uint32_t mck_mult, mck_ctl, mck_div;     // MCK: multiplier (0 = off) and what GPCLK0 was given
 
 static uint32_t micros(void) {
     return REG(0x3F003004u);
@@ -93,6 +97,44 @@ static uint32_t pick_channel(void) {
     return 4;
 }
 
+// Stops a clock-manager clock at the end of its cycle, and kills it only if it will not stop.
+static void cm_stop(uint32_t ctl_reg) {
+    REG(ctl_reg) = CM_PASSWD | (REG(ctl_reg) & 0x60Fu);
+    uint32_t t0 = micros();
+    while ((REG(ctl_reg) & CM_BUSY) && micros() - t0 < 1000u) {
+    }
+    if (REG(ctl_reg) & CM_BUSY) {
+        REG(ctl_reg) = CM_PASSWD | CM_KILL;
+        while ((REG(ctl_reg) & CM_BUSY) && micros() - t0 < 2000u) {
+        }
+    }
+}
+
+// MCK on GPCLK0 (GPIO 4) runs from the SMI's source at the SMI divider times 768 / multiplier, so it is
+// a fixed fraction of the SMI clock through every PLLA move, trim and fallback. On PLLA the divider is
+// an integer; on PLLD it carries the SMI's fraction, dithered by MASH 1 the same way.
+static void mck_apply(void) {
+    uint32_t ctl = 0, div = 0;
+    if (mck_mult && st.div_q8) {
+        div = st.div_q8 * (SMI_FRAME_WORDS * CYCLE_CLOCKS / mck_mult) << 4;    // DIVI 23:12, DIVF 11:0
+        ctl = (REG(CM_SMICTL) & 15u) | ((div & 0xFFFu) ? CM_MASH1 : 0u);
+    }
+    if (ctl == mck_ctl && div == mck_div) {
+        return;
+    }
+    cm_stop(CM_GP0CTL);
+    uint32_t fsel = REG(GPFSEL0) & ~(7u << 12);
+    if (ctl) {
+        REG(CM_GP0DIV) = CM_PASSWD | div;
+        REG(CM_GP0CTL) = CM_PASSWD | ctl;
+        REG(CM_GP0CTL) = CM_PASSWD | ctl | CM_ENAB;
+        fsel |= 4u << 12;   // ALT0: GPCLK0
+    }
+    REG(GPFSEL0) = fsel;
+    mck_ctl = ctl;
+    mck_div = div;
+}
+
 // 256 fs words of CYCLE_CLOCKS clocks each. From PLLA the divider is an integer (PiZero_PLLA_plan.md).
 // From PLLD the fraction is dithered by MASH 1, so the average is exact to the 1/256 step (about 70 ppm
 // at worst here). A move between PLLA rows is live, so the clock never waits for a lock here.
@@ -106,23 +148,15 @@ static void clock_set(uint32_t freq) {
         div = (uint32_t)((((uint64_t)500000000u << 8) + want / 2u) / want);
         ctl = CM_SRC_PLLD | CM_MASH1;
     }
-    // Stop the clock at the end of its cycle before changing it, and kill it only if it will not stop.
     // CM_SMI's MASH bit reads back set whatever is written; with DIVF 0 it never dithers.
-    REG(CM_SMICTL) = CM_PASSWD | (REG(CM_SMICTL) & 0x60Fu);
-    uint32_t t0 = micros();
-    while ((REG(CM_SMICTL) & CM_BUSY) && micros() - t0 < 1000u) {
-    }
-    if (REG(CM_SMICTL) & CM_BUSY) {
-        REG(CM_SMICTL) = CM_PASSWD | CM_KILL;
-        while ((REG(CM_SMICTL) & CM_BUSY) && micros() - t0 < 2000u) {
-        }
-    }
+    cm_stop(CM_SMICTL);
     REG(CM_SMIDIV) = CM_PASSWD | ((div >> 8) & 15u) << 12 | (div & 255u) << 4;     // DIVI 15:12, DIVF 11:4
     REG(CM_SMICTL) = CM_PASSWD | ctl;
     REG(CM_SMICTL) = CM_PASSWD | ctl | CM_ENAB;
     pll_out_set_in_use(plla);
     st.div_q8 = div;
     st.freq = freq;
+    mck_apply();
 }
 
 // Brings st.frames up to the DMA position. Interrupts must be masked. Whole rings are inferred from the
@@ -285,6 +319,20 @@ void smi_out_set_source(uint32_t src) {
     }
     source = src;
     smi_out_set_rate(st.freq);
+}
+
+void smi_out_pin(uint32_t gpio, bool on) {
+    uint32_t reg = 0x3F200000u + 4u * (gpio / 10u), shift = 3u * (gpio % 10u);
+    uint32_t save = irq_global_disable();
+    REG(reg) = (REG(reg) & ~(7u << shift)) | (on ? 5u << shift : 0u);   // ALT1: SMI, or an input
+    irq_global_restore(save);
+}
+
+void smi_out_mck(uint32_t mult) {
+    uint32_t save = irq_global_disable();
+    mck_mult = mult == 128u || mult == 256u ? mult : 0u;
+    mck_apply();
+    irq_global_restore(save);
 }
 
 uint32_t smi_out_source(void) {

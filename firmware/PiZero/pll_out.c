@@ -12,6 +12,10 @@
 #define CM_PCMDIV (CPRMAN + 0x09cu)
 #define CM_SMICTL (CPRMAN + 0x0b0u)
 #define CM_SMIDIV (CPRMAN + 0x0b4u)
+#define CM_GP0CTL (CPRMAN + 0x070u)
+#define CM_GP0DIV (CPRMAN + 0x074u)
+#define GPFSEL0 0x3F200000u
+#define GPFSEL1 0x3F200004u
 #define CM_V3DCTL (CPRMAN + 0x038u)
 #define CM_V3DDIV (CPRMAN + 0x03cu)
 #define CM_TCNTCTL (CPRMAN + 0x0c0u)
@@ -468,6 +472,10 @@ void pll_out_status(pll_out_status_t *out) {
     st.pcm_div = rd(CM_PCMDIV);
     st.smi_ctl = rd(CM_SMICTL);
     st.smi_div = rd(CM_SMIDIV);
+    st.gp0_ctl = rd(CM_GP0CTL);
+    st.gp0_div = rd(CM_GP0DIV);
+    st.gpfsel0 = REG(GPFSEL0);
+    st.gpfsel1 = REG(GPFSEL1);
     st.in_use = in_use;
     *out = st;
 }

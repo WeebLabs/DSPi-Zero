@@ -154,7 +154,7 @@ Frequency is proven by phases 1 to 3. Jitter needs one of these, in order of pre
 
 ### Later, not part of this work
 
-- MCK on a GPCLK pin from `plla_per` with an integer divider (/24 for 256 fs), which is locked to the SMI clock by construction.
+- MCK on a GPCLK pin from `plla_per` with an integer divider (/24 for 256 fs), which is locked to the SMI clock by construction. **Done 2026-11-12, section 14.**
 - The PCM block clocked from `plla_per` with an integer divider when it is used as an I2S master for inputs, so that input and output sampling share one clock. Linux restricts PCM to the oscillator and PLLD only because other sources "may have varying rates or be switched off" (line 1572), which does not apply once we own PLLA.
 - HSM from `plla_per` for HDMI audio, and the PER divider decision in 1.5 item 4.
 - Connecting `pll_out_trim()` to DSPi's clock tracking.
@@ -454,3 +454,24 @@ Code:
 **Not covered.** No HDMI hot-plug or thermal throttling episode happened during the soak; the watchdog is the protection against both. Phase 4 (jitter) needs an instrument, and the receiver-lock part of phase 5 needs a receiver.
 
 **Verdict.** Phase 6 passes. PLLA with integer dividers is the audio clock, with a watchdog and a PLLD fallback.
+
+## 14. MCK from the SMI's clock (2026-11-12)
+
+The first item of "Later, not part of this work" in section 3.
+
+**Pin.** MCK comes out on GPIO 4 (header pin 7), as GPCLK0 on ALT0. On the header, only GPIO 4, 5, 20 and 21 can carry a general-purpose clock. GPCLK2 is left alone because the Zero 2 W's wireless chip may take its 32 kHz clock from it, and GPIO 20 and 21 belong to the PCM block, which is kept for inputs. The firmware had left GPCLK0 stopped (CM_GP0CTL source 0). DSPi's MCK pin setting is kept as bookkeeping only, as the output pins are, because DSPi's RP2350 default (GPIO 13) is the SMI's LRCLK here.
+
+**Divider.** GPCLK0 runs from the same source as the SMI, at the SMI's divider times 768 / multiplier. MCK is therefore a fixed fraction of the SMI clock: 3 or 6 times the SMI divider for 256 fs or 128 fs. On PLLA every supported case is an integer: /30 and /60 at 44.1 and 48 kHz, and /15 and /30 at 96 kHz. On PLLD the divider carries the SMI's own fraction, dithered by MASH 1, so the average ratio is still exact. The clock is reprogrammed from `smi_out.c`'s `clock_set()`, so it follows rate changes and the watchdog's move to PLLD. PLLA family moves and trims reach it through `plla_per` with no reprogramming.
+
+**DSPi's side.** The shim's `audio_i2s_mck_*` hooks now drive the clock through `smi_out_mck()`. The port's main loop gained DSPi's `apply_mck_policy()`, called where `main.c` calls it: after a type switch, at the end of a restore, and on an I2S clock-mode change. It is also called when the input switches to I2S, where `main.c`'s `i2s_input_bringup_prefill()` starts MCK for a master input. MCK therefore runs only when MCK is enabled, a slot or the input is I2S, and I2S is not a clock slave. A rate change also updates MCK, as in `main.c`'s `apply_nominal_output_rate()`.
+
+**Test.** `tools/mck_check.py` turns MCK on with DSPi's `REQ_SET_MCK_ENABLE` and plays a tone straight to the Pi. The clock manager's counter reads GPCLK0 on mux 20.
+- At 44.1, 48 and 96 kHz with both multipliers, MCK read exactly mult x fs (+0.000 ppm), from PLLA with an integer divider and no MASH.
+- A +10 ppm PLLA trim moved MCK by +9.969 ppm.
+- With the SMI moved to PLLD, MCK read +64.087 ppm against the SMI's +64.019 ppm, so the two stay locked to the counter's resolution. Back on PLLA, MCK read exact again.
+- With no I2S slot, DSPi's policy stopped GPCLK0 and returned GPIO 4 to an input, and MCK restarted when slot 0 went back to I2S. `REQ_SET_MCK_ENABLE` 0 stopped it.
+
+`smi_check.py` still passes, and `usb_health.py` shows no hang recoveries or wait timeouts.
+
+**Not covered.** The waveform on the pin has not been looked at, and no DAC has been run from it yet.
+

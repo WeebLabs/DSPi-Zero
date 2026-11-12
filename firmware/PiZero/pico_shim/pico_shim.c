@@ -30,6 +30,7 @@
 #include "board.h"
 #include "mbox.h"
 #include "smi_out.h"
+#include "adat_output.h"
 #include "uart.h"
 
 // After the Pi's uart.h: this one renames the SDK's uart_init.
@@ -272,7 +273,12 @@ int pio_sm_init(PIO pio, uint sm, uint initial_pc, const pio_sm_config *config) 
     (void)pio, (void)sm, (void)initial_pc, (void)config;
     return 0;
 }
+static void shim_adat_enable(bool on);
+
 void pio_sm_set_enabled(PIO pio, uint sm, bool enabled) {
+    if (PIO_NUM(pio) == 1u && sm == 1u) {
+        shim_adat_enable(enabled);  // adat_output.c's state machine
+    }
     if (enabled) {
         pio->ctrl |= 1u << sm;
     } else {
@@ -1281,17 +1287,25 @@ bool audio_i2s_extclk_framing_slipped(void) {
     return false;
 }
 
+// MCK always comes out on GPIO 4 (GPCLK0), from the SMI's clock (smi_out_mck()). DSPi's MCK pin is kept
+// as bookkeeping only, as the output pins are.
 static uint8_t mck_pin = 0xff;
 static bool mck_enabled;
+static uint32_t mck_mult = 256;
 
 void audio_i2s_mck_setup(uint pin) {
     mck_pin = (uint8_t)pin;
 }
 void audio_i2s_mck_set_enabled(bool enabled) {
     mck_enabled = enabled && mck_pin != 0xff;
+    smi_out_mck(mck_enabled ? mck_mult : 0u);
 }
 void audio_i2s_mck_update_frequency(uint32_t sample_freq, uint32_t multiplier) {
-    (void)sample_freq, (void)multiplier;
+    (void)sample_freq;
+    mck_mult = multiplier;
+    if (mck_enabled) {
+        smi_out_mck(mck_mult);
+    }
 }
 void audio_i2s_mck_change_pin(uint new_pin) {
     mck_pin = (uint8_t)new_pin;
@@ -1306,9 +1320,9 @@ void audio_i2s_mck_apply_state(uint pin, bool enabled, uint32_t sample_freq, uin
     if (mck_pin == 0xff) {
         return;
     }
-    (void)sample_freq, (void)multiplier;
     mck_pin = (uint8_t)pin;
-    mck_enabled = enabled;
+    audio_i2s_mck_update_frequency(sample_freq, multiplier);
+    audio_i2s_mck_set_enabled(enabled);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1322,6 +1336,7 @@ void audio_i2s_mck_apply_state(uint pin, bool enabled, uint32_t sample_freq, uin
 #define SMI_SLOTS 4u
 #define SMI_BIT_BCK 4u
 #define SMI_BIT_LRCLK 5u
+#define SMI_BIT_ADAT 8u   // SD8, GPIO 16, claimed only while ADAT is enabled
 #define SMI_PIN_MASK (0x3Fu << 8)
 #define SMI_RING_FRAMES 128u
 
@@ -1332,6 +1347,30 @@ extern uint8_t slot_ring_store[];   // usb_audio.c: one PICO_AUDIO_SPDIF_RING_BY
 static uint8_t lut_cell2[256][16] __attribute__((aligned(16)));    // 8 cells, bit 0 first, to 16 words
 static uint8_t lut_bck4[256][32] __attribute__((aligned(16)));     // 8 I2S bits to 32 words
 static uint8_t i2s_clock_bytes[SMI_FRAME_WORDS] __attribute__((aligned(16)));   // BCK and LRCLK, a byte a word
+static uint8_t lut_msb8[256][8] __attribute__((aligned(8)));     // 8 bits, MSB first, to 8 words
+
+// adat_output.c's stream: DMA channel 13 into pio1 SM 1, one bit per PIO cycle at 256 fs. The composer
+// plays the ring that channel was given from the frame the state machine was enabled, one bit per SMI
+// word on SD8, and moves the channel's read address on as it composes, as the DMA would.
+#define ADAT_DMA_CH 13u
+#define ADAT_FRAME_WORDS 8u
+static const uint32_t *adat_ring;
+static uint32_t adat_ring_frames, adat_start;
+static volatile bool adat_on;
+
+static void shim_adat_enable(bool on) {
+    if (on) {
+        dma_channel_hw_t *ch = &pico_shim_dma_hw.ch[ADAT_DMA_CH];
+        adat_ring = (const uint32_t *)(uintptr_t)ch->read_addr;
+        adat_ring_frames = ch->transfer_count / ADAT_FRAME_WORDS;
+        adat_start = shim_output_clock();
+    }
+    adat_on = on && adat_ring && adat_ring_frames;
+    // As on the RP2350, a stopped stream holds the pin low until ADAT is disabled, which frees it.
+    if (adat_on || !adat_output_config_enabled()) {
+        smi_out_pin(8u + SMI_BIT_ADAT, adat_on);
+    }
+}
 
 typedef struct {
     const uint32_t *ring;
@@ -1348,6 +1387,9 @@ static void smi_tables_init(void) {
             for (uint32_t k = 0; k < 4u; k++) {
                 lut_bck4[v][4u * j + k] = b;
             }
+        }
+        for (uint32_t j = 0; j < 8u; j++) {
+            lut_msb8[v][j] = (uint8_t)((v >> (7u - j)) & 1u);
         }
     }
     // Philips I2S: BCK low then high within each bit (data changes on the falling edge), LRCLK low for
@@ -1408,6 +1450,7 @@ static void smi_compose(uint32_t frame, uint16_t *dst, uint32_t n) {
     for (uint32_t s = 0; s < nf; s++) {
         by_slot[found[s].bit] = &found[s];
     }
+    bool adat = adat_on;
     for (uint32_t k = 0; k < n; k++, frame++, dst += SMI_FRAME_WORDS) {
         const uint8_t *rows[SMI_SLOTS][16];   // per slot, the 16-byte table row for each block
         for (uint32_t s = 0; s < SMI_SLOTS; s++) {
@@ -1440,6 +1483,9 @@ static void smi_compose(uint32_t frame, uint16_t *dst, uint32_t n) {
                 }
             }
         }
+        // ADAT words are line levels, MSB first: each 16-word block takes half a word. They fill the
+        // high byte of each SMI word, so the store interleaves the two byte vectors.
+        const uint32_t *aw = adat ? &adat_ring[((frame - adat_start) % adat_ring_frames) * ADAT_FRAME_WORDS] : NULL;
         for (uint32_t q = 0; q < 16u; q++) {
             uint8x16_t acc = vld1q_u8(rows[0][q]);
             acc = vsliq_n_u8(acc, vld1q_u8(rows[1][q]), 1);
@@ -1448,9 +1494,17 @@ static void smi_compose(uint32_t frame, uint16_t *dst, uint32_t n) {
             if (any_i2s) {
                 acc = vorrq_u8(acc, vld1q_u8(&i2s_clock_bytes[16u * q]));
             }
-            vst1q_u16(&dst[16u * q], vmovl_u8(vget_low_u8(acc)));
-            vst1q_u16(&dst[16u * q + 8u], vmovl_u8(vget_high_u8(acc)));
+            uint8x16x2_t out = {{acc, vdupq_n_u8(0)}};
+            if (aw) {
+                uint32_t bits = aw[q >> 1] >> ((q & 1u) ? 0u : 16u);
+                out.val[1] = vcombine_u8(vld1_u8(lut_msb8[(bits >> 8) & 0xFFu]), vld1_u8(lut_msb8[bits & 0xFFu]));
+            }
+            vst2q_u8((uint8_t *)&dst[16u * q], out);
         }
+    }
+    if (adat) {
+        pico_shim_dma_hw.ch[ADAT_DMA_CH].read_addr =
+            (uint32_t)(uintptr_t)&adat_ring[((frame - adat_start) % adat_ring_frames) * ADAT_FRAME_WORDS];
     }
 }
 
