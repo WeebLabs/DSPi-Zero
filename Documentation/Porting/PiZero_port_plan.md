@@ -142,8 +142,21 @@ These come after Z5. They decide whether the section 4 design is possible or onl
 |---|---|
 | Maximum sustained SMI write rate, with DMA, on 8 and 16 pins | Must reach 12.288 MHz (256 fs at 48 kHz) for ADAT and S/PDIF on one stream. Higher rates need more. **Measured 2026-11-12 on 16 pins: 12.288 and 24.576 MHz stream cleanly, and the real ceiling is about 37 MHz (bring-up section 19).** |
 | Maximum sustained SMI read rate | Decides whether SMI could ever capture inputs. |
-| Maximum PCM bit clock in master receive mode | Sets how fast S/PDIF and ADAT can be oversampled, and therefore which input rates are possible. |
+| Maximum PCM bit clock in master receive mode | Sets how fast S/PDIF and ADAT can be oversampled, and therefore which input rates are possible. **Throughput measured 2026-11-12: the block and its DMA capture every bit clock up to 250 MHz, the fastest clock tried, with no FIFO overflow (section 6.1). Sampling a real signal at those rates is not yet checked.** |
 | Pin-to-pin skew across SMI outputs | Confirms the slot alignment claim with a logic analyser. |
+
+### 6.1 PCM receive rate (2026-11-12)
+
+`pcm_rx.c` runs the PCM block as clock and frame master with two 32-bit receive channels filling each 64-bit frame, so every bit clock is one captured bit. A DMA channel loops over a 256 KB ring in the uncached region. Bench request `0x47` runs a capture from the main loop, and `tools/pcm_rx_check.py` sweeps the PCM clock. For each clock, it compares the bits captured per second with the clock read by the clock manager's counter.
+
+| Source | PCM clock | Captured | RX FIFO overflows |
+|---|---|---|---|
+| PLLA /30 to /2 | 12.288 to 184.320 MHz | equal to the clock (+0.0 ppm) | 0 |
+| PLLD /4, /3, /2 | 125.0, 166.7, 250.0 MHz | equal to the clock within 2.6 ppm | 0 |
+
+At 250 MHz the DMA writes about 31 MB/s with no errors. No faster clock is available from an integer divider of these sources, so 250 MHz is a lower bound on the limit, not the limit itself. The 2.6 ppm on PLLD appears at every PLLD divider and not on PLLA. Its cause is not known.
+
+**Not yet checked.** GPIO 20 (PCM_DIN) had nothing connected, so every captured bit was 0. Whether the block samples a real signal correctly at these rates needs a signal on the pin. The simplest is a jumper from an SMI output, such as slot 1 on GPIO 8 (header pin 24), to GPIO 20 (header pin 38), and then decoding the captured S/PDIF.
 
 ## 7. Open risks
 

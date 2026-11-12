@@ -42,6 +42,7 @@
 #include "pmu.h"
 #include "pcm_out.h"
 #include "smi_out.h"
+#include "pcm_rx.h"
 #include "clk_dump.h"
 #include "pll_out.h"
 #include "device/dcd.h"
@@ -643,6 +644,19 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         }
         return true;
     }
+    // 0x47: PCM receive rate (port plan section 6). OUT runs a capture of wValue ms from the main loop, at
+    // the PCM clock bench request 0x46 op 2 set; IN returns the result.
+    if (bench && req->bRequest == 0x47) {
+        if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+        }
+        if (in) {
+            const pcm_rx_result_t *r = pcm_rx_result();
+            return tud_control_xfer(rhport, req, (void *)r, req->wLength < sizeof(*r) ? req->wLength : sizeof(*r));
+        }
+        pcm_rx_request(req->wValue);
+        return tud_control_status(rhport, req);
+    }
     // 0x46: PLLA (PiZero_PLLA_plan.md phase 1). OUT wValue 1 retunes to row wIndex, 2 drives the unused
     // PCM clock from source wIndex >> 12 with integer divider wIndex & 0xFFF, 3 starts the frequency
     // counter on mux wIndex & 0xFF for (wIndex >> 8) x 192000 oscillator cycles, 4 puts the SMI on PLLA
@@ -1205,6 +1219,7 @@ int main(void) {
     for (;;) {
         sensors_refresh();
         pll_out_poll();
+        pcm_rx_poll();
         if (pll_out_watchdog() == PLL_WD_FALLBACK) {
             smi_out_set_source(SMI_SRC_PLLD);   // PLLA keeps being rewritten: stay on PLLD until reboot
         }
