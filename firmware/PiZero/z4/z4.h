@@ -18,3 +18,4 @@ uint32_t shim_smi_snapshot(uint16_t *out, uint32_t n);  // bench: n composed fra
 void z4_dspi_init(void);        // main.c's core0_init(), less what needs RP2350 hardware
 void z4_dspi_service(void);     // one pass of main.c's deferred work
 void z4_stream_restart(void);   // a host stream is starting: host rate, then a synchronized restart
+void z4_sync_core1_mode(void);  // z4_mainloop.c: Core 1 does not exist, so its mode is held idle

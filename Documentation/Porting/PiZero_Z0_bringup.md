@@ -762,3 +762,15 @@ DSPi's own CPU figure (`global_status.cpu0_load`) is the time `process_input_blo
 
 **Polling left out.** The main loop runs about 270,000 passes a second, and the calls that find nothing to do take 50 to 65% of the core. That is waiting, which a sleeping loop would not spend, so it is not counted.
 
+## 25. Output toggles froze the main loop
+
+*Added: 2026-11-12*
+
+**Symptom.** Toggling outputs on and off in DSPi Console's matrix mixer froze the board until it was power cycled.
+
+**Cause.** `REQ_SET_OUTPUT_ENABLE` recomputes DSPi's Core 1 mode. With any of outputs 3 to 8 enabled, that is the EQ worker mode, in which `process_input_block()` hands outputs 3 to 8 to Core 1 and waits, with `__wfe()`, for Core 1 to finish. The Pi runs one core, and the port held the mode idle only once per main-loop pass, in DSPi's services. But vendor requests are handled in `tud_task()` inside the producer, and the producer runs its blocks straight afterwards. So a toggle followed by a block in the same pass waited forever. The bug dates from Z4b; no earlier test toggled outputs.
+
+**Fix.** The producer calls `z4_sync_core1_mode()` between `tud_task()` and any block, so no block ever sees a Core 1 mode.
+
+**Check.** `tools/output_toggle_check.py` toggled random outputs, including outputs 3 to 8 and PDM, 400 times at 50 a second while a tone played. The board kept answering, `core1_mode` read 0 throughout, the stream ran with no late compositions, and the outputs were put back. The old image was not run against this test, to avoid another power cycle, so the cause comes from the code rather than from a reproduction.
+

@@ -1175,6 +1175,7 @@ void z4_service_producer(void) {
     last = now;
     cpu_meter_enter();
     tud_task();
+    z4_sync_core1_mode();   // before any block: a request just handled may have asked for Core 1
     consume_task();
     input_delivery_mark();
     if (input_source_is_spdif(active_input_source)) {

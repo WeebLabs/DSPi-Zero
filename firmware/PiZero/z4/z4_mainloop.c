@@ -708,7 +708,10 @@ static void service_coefficients(void) {
 
 // Core 1 does not exist here: every output runs in the pipeline's single-core path, PDM included
 // (its samples queue for a Core 1 that never drains them).
-static void sync_core1_mode(void) {
+// There is no Core 1, so its mode stays idle. A vendor request (an output enable, say) can set the EQ
+// worker mode, and a block run in that mode waits forever for Core 1, so the producer calls this between
+// handling USB requests and running any block.
+void z4_sync_core1_mode(void) {
     if (core1_mode != CORE1_MODE_IDLE) {
         core1_mode = CORE1_MODE_IDLE;
     }
@@ -1059,7 +1062,7 @@ static void service_presets(void) {
         crossfeed_update_pending = true;
         memset(delay_lines, 0, sizeof(delay_lines));
         limiter_reset_all();
-        sync_core1_mode();
+        z4_sync_core1_mode();
         if (!apply_restored_outputs(old_types)) {
             complete_pipeline_reset();
         }
@@ -1101,7 +1104,7 @@ static void service_outputs_and_bulk(void) {
             float rate = (float)audio_state.freq;
             dsp_recalculate_all_filters(rate);
             dsp_update_delay_samples(rate);
-            sync_core1_mode();
+            z4_sync_core1_mode();
             if (!apply_restored_outputs(old_types)) {
                 if (input_source_is_spdif(active_input_source)) {
                     reset_usb_feedback_loop();
@@ -1263,7 +1266,7 @@ void z4_dspi_service(void) {
     service_presets();
     service_outputs_and_bulk();
     service_input_config();
-    sync_core1_mode();
+    z4_sync_core1_mode();
 
     busy = false;
 }
