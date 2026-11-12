@@ -30,13 +30,16 @@ DSPI_STATES = ("inactive", "acquiring", "locked", "relocking")
 
 
 def rx(dev):
-    raw = bytes(dev.ctrl_transfer(0xC0, 0x44, 0, 0, 4 * (len(FIELDS) + 8), timeout=1000))
+    raw = bytes(dev.ctrl_transfer(0xC0, 0x44, 0, 0, 4 * (len(FIELDS) + 14), timeout=1000))
     v = struct.unpack_from("<%dI" % len(FIELDS), raw)
     s = dict(zip(FIELDS, v))
     if s["magic"] != 0x58524453:
         raise SystemExit("FAIL: no S/PDIF receiver status (load the current pizero_z4.img)")
     s["samples"] = s["samples_lo"] | s["samples_hi"] << 32
     s["last"] = struct.unpack_from("<8I", raw, 4 * len(FIELDS))
+    if len(raw) >= 4 * (len(FIELDS) + 14):
+        s.update(zip(("inv_cycles", "dec_cycles", "dec_inst", "dec_l1d", "dec_l2d", "dec_br"),
+                     struct.unpack_from("<6I", raw, 4 * (len(FIELDS) + 8))))
     return s
 
 
@@ -185,6 +188,13 @@ def real_source(dev, watch, failures):
         if now >= end:
             break
     print(f"  newest samples {samples}")
+    if "dec_cycles" in c:
+        nsub = max(c["subframes"] - a["subframes"], 1)
+        per = {k: ((c[k] - a[k]) & 0xFFFFFFFF) / nsub for k in ("dec_cycles", "dec_inst", "dec_l1d", "dec_l2d", "dec_br",
+                                                              "inv_cycles")}
+        print(f"  per subframe: {per['dec_cycles']:.0f} cycles decoding ({per['dec_inst']:.0f} instructions, "
+              f"{per['dec_l1d']:.1f} L1D and {per['dec_l2d']:.1f} L2D refills, {per['dec_br']:.1f} branch misses), "
+              f"{per['inv_cycles']:.0f} cycles invalidating")
     if c["decode_errors"] != a["decode_errors"] or c["parity_errors"] != a["parity_errors"]:
         failures.append("decode or parity errors while locked")
     if s1["slot0_underrun_frames"] != s0["slot0_underrun_frames"] or sc["late"] != sa["late"]:

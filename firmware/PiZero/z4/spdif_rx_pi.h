@@ -17,6 +17,8 @@ typedef struct {
     uint32_t pcm_cs, dma_debug;
     uint32_t monitor;                   // 1 while running for the bench, not for DSPi
     uint32_t last[8];                   // the newest FIFO words, oldest first
+    uint32_t inv_cycles;                // cycles invalidating chunks out of the cache
+    uint32_t dec_cycles, dec_inst, dec_l1d_refill, dec_l2d_refill, dec_br_mispred;    // decoding
 } spdif_rx_pi_status_t;
 
 void spdif_rx_pi_status(spdif_rx_pi_status_t *out);

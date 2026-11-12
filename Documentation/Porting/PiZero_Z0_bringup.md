@@ -724,7 +724,7 @@ DSPi's S/PDIF input now runs on the Pi. `spdif_input.c` and `input_servo.c` are 
 
 **Decoding** (`spdif_decode.c`, tested on the Mac by `tests/spdif_decode_test.c`).
 - **Finding the stream:** the decoder times level changes, measures the cell from the longest runs, and looks for two preambles 64 cells apart. Their spacing gives the cell length precisely.
-- **Tracking:** it reads each time slot from two samples at its cell centres; a 1 is a level change between them. It re-anchors on a slot's leading edge every 8 cells, using one count-leading-zeros on a 32-sample window. Every slot must start with a level change, and every subframe with a valid preamble, or the stream counts as lost and the search starts again.
+- **Tracking:** every time slot starts with a level change, so a slot's first cell is the inverse of the cell before it, and only the second cell's centre is read: a 1 is a second cell equal to the cell before the slot. The decoder re-anchors on a slot's leading edge every 8 cells, using one count-leading-zeros on a 32-sample window. If an anchor edge is missing, or a subframe does not start with a valid preamble, the stream counts as lost and the search starts again. Parity errors are counted, not dropped, as by the RP2350's library.
 - **Mac test:** subframes decode exactly at 44.1, 48 and 96 kHz, clean and with ±0.2 cells of edge jitter (16 ns at 96 kHz). At 62.5 MHz sampling, 96 kHz with that jitter fails, so the sampling stays at 125 MHz.
 
 **Library behaviour.** Blocks of 384 subframes start at a B preamble. Four aligned blocks at one rate make the receiver STABLE and call DSPi's lock callback. A misaligned block, a rate change, or 10 ms without a block loses the lock. The FIFO is DSPi's input capture arena. Block timestamps come from each block's sample position, referred to the chunk interrupt's system-timer time, so the servo's long-window rate uses the crystal's time base, as on the RP2350.
@@ -737,7 +737,16 @@ DSPi's S/PDIF input now runs on the Pi. `spdif_input.c` and `input_servo.c` are 
 - **Tracking:** DSPi's servo held the PLLA trim at -43.2 to -43.9 ppm, following the source's clock. The trim returned to exactly 0 on the switch back to USB.
 - **No signal:** with nothing connected, the receiver reports no signal, DSPi reports acquiring, and USB playback is clean afterwards.
 
-**Cost.** The decoding interrupt takes 13.9% of the CPU at 48 kHz. About 4.8 points of that is reading 15.6 MB/s of samples, which is spent even with no signal. DSPi Console's CPU figure includes it since section 24. A first version that handled every level change took 27.5%.
+**Cost.** The decoding interrupt takes 6.96% of the CPU at 48 kHz, 644 cycles a subframe. The CPU's performance counters showed decoding is bound by instructions, not memory: about 2.5 L2 refills a subframe. The cost came down in four steps.
+
+| Version | CPU at 48 kHz | Cycles a subframe |
+|---|---|---|
+| Every level change timed and sorted | 27.5% | |
+| Two samples a slot at the cell centres | 13.9% | 1368 |
+| The same, with offsets worked out once a subframe and each group of four slots unrolled | 10.1% | 968 |
+| One sample a slot | 6.96% | 644 |
+
+The last step gives up checking every slot boundary: a slip shows at the next anchor, at most four slots on, or at the next preamble. Thirty seconds of the 48 kHz source decoded with no decode or parity errors. Invalidating each chunk from the cache adds 77 cycles a subframe. With nothing connected, the search reads every word, which costs about 4.8%. DSPi Console's CPU figure includes the decoding (section 24).
 
 **Not covered.** The source was 48 kHz only. 44.1 and 96 kHz from a real source, unplugging and replugging, and a source changing rate are untested. 96 kHz should roughly double the decoding cost. ADAT input is not started.
 
@@ -757,6 +766,8 @@ DSPi's own CPU figure (`global_status.cpu0_load`) is the time `process_input_blo
 | USB tone at 48 kHz | 13.8% | 8.3% | 4.0% | 1.4% |
 | USB tone at 96 kHz | 21.2% | 13.8% | 4.6% | 2.8% |
 | S/PDIF input at 48 kHz | 24.4% | 20.2% | 2.7% | 1.5% |
+
+The S/PDIF row was taken before the decoder was made cheaper (section 23). It now reads 19.4%, with interrupts at 14.1%.
 
 `REQ_GET_STATUS` wValue 9, which DSPi Console reads, returned the same figure as the meter, rounded.
 

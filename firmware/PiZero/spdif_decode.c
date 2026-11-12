@@ -125,8 +125,9 @@ static void search(spdif_decoder_t *d, const uint32_t *ring, uint32_t mask, uint
 // ---------------------------------------------------------------------------------------------------
 // Tracking: two samples a time slot, at the cell centres
 
+// The line level at sample p.
 static inline uint32_t level_at(const uint32_t *ring, uint32_t mask, uint32_t p) {
-    return (ring[(p >> 5) & mask] >> (31u - (p & 31u))) & 1u;
+    return (ring[(p >> 5) & mask] << (p & 31u)) >> 31;
 }
 
 // The samples from p on that differ from `level`, as a 32-bit window with sample p in bit 31.
@@ -134,11 +135,6 @@ static inline uint32_t changes_from(const uint32_t *ring, uint32_t mask, uint32_
     uint32_t w0 = ring[(p >> 5) & mask], sh = p & 31u;
     uint32_t x = sh ? (w0 << sh) | (ring[((p >> 5) + 1u) & mask] >> (32u - sh)) : w0;
     return x ^ (0u - level);
-}
-
-// Samples from the anchor to the centre of the cell `k` cells on.
-static inline uint32_t to_centre(uint32_t cell_q8, uint32_t k) {
-    return ((2u * k + 1u) * cell_q8) >> 9;
 }
 
 // Reads the subframe whose first edge is d->start. Returns 1 after emitting it, 0 if the ring does not
@@ -150,42 +146,43 @@ static int track_one(spdif_decoder_t *d, const uint32_t *ring, uint32_t mask, ui
     if ((int32_t)((uint32_t)end - need) < 0) {
         return 0;
     }
+    // Centres of the eight cells after an anchor, the same for the whole subframe.
+    uint32_t off[8];
+    for (uint32_t j = 0; j < 8u; j++) {
+        off[j] = ((2u * j + 1u) * c) >> 9;
+    }
     // The preamble's eight cells, read so the first is 1: B 11101000, M 11100010, W 11100100.
-    uint32_t flip = level_at(ring, mask, s + to_centre(c, 0)) ^ 1u, pat = 0;
-    for (uint32_t k = 0; k < 8u; k++) {
-        pat = pat << 1 | (level_at(ring, mask, s + to_centre(c, k)) ^ flip);
+    uint32_t flip = level_at(ring, mask, s + off[0]) ^ 1u, pat = 0;
+    for (uint32_t j = 0; j < 8u; j++) {
+        pat = pat << 1 | (level_at(ring, mask, s + off[j]) ^ flip);
     }
     uint32_t word = pat == 0xE8u ? SPDIF_SYNC_B : pat == 0xE2u ? SPDIF_SYNC_M : pat == 0xE4u ? SPDIF_SYNC_W : 0u;
     if (!word) {
         return -1;
     }
     uint32_t prev = (pat & 1u) ^ flip;
-    uint32_t anchor = s, base = 0;     // cell `base` starts at sample `anchor`
-    uint32_t limit = c >> 8;           // an edge more than a cell past the last centre is not one
-    for (uint32_t slot = 4; slot < 33u; slot++) {
-        uint32_t k = 2u * slot;
-        if ((slot & 3u) == 0u) {
-            // Re-anchor on this slot's leading edge (slot 32 is the next preamble's), found between the
-            // last cell's centre and this one's.
-            uint32_t from = anchor + to_centre(c, k - 1u - base);
-            uint32_t t = changes_from(ring, mask, from, prev);
-            uint32_t off = t ? (uint32_t)__builtin_clz(t) : 32u;
-            if (off > limit) {
-                return -1;
-            }
-            anchor = from + off;
-            base = k;
-            if (slot == 32u) {
-                break;
-            }
+    uint32_t anchor = s, limit = c >> 8;
+    // Seven groups of four time slots, each anchored on its first slot's leading edge, then the next
+    // preamble's edge. Every slot starts with a level change, so its first cell is the inverse of the
+    // cell before; only the second is read, and a 1 is a second cell equal to the cell before the slot.
+    for (uint32_t g = 0; g < 8u; g++) {
+        uint32_t from = anchor + off[7];
+        uint32_t t = changes_from(ring, mask, from, prev);
+        uint32_t edge = t ? (uint32_t)__builtin_clz(t) : 32u;
+        if (edge > limit) {
+            return -1;
         }
-        uint32_t a = level_at(ring, mask, anchor + to_centre(c, k - base));
-        uint32_t b = level_at(ring, mask, anchor + to_centre(c, k + 1u - base));
-        if (a == prev) {
-            return -1;     // every time slot starts with a level change
+        anchor = from + edge;
+        if (g == 7u) {
+            break;
         }
-        word |= (a ^ b) << slot;
-        prev = b;
+        uint32_t b0 = level_at(ring, mask, anchor + off[1]);
+        uint32_t b1 = level_at(ring, mask, anchor + off[3]);
+        uint32_t b2 = level_at(ring, mask, anchor + off[5]);
+        uint32_t b3 = level_at(ring, mask, anchor + off[7]);
+        uint32_t bits = (b0 ^ prev ^ 1u) | (b1 ^ b0 ^ 1u) << 1 | (b2 ^ b1 ^ 1u) << 2 | (b3 ^ b2 ^ 1u) << 3;
+        word |= bits << (4u + 4u * g);
+        prev = b3;
     }
     emit(word, full_index(end, s), ctx);
     d->subframes++;

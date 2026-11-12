@@ -13,6 +13,7 @@
 #include "pll_out.h"
 #include "spdif_decode.h"
 #include "spdif_rx_pi.h"
+#include "pmu.h"
 
 void data_invalidate(volatile void *starting_address, size_t size);
 
@@ -111,6 +112,7 @@ static volatile uint64_t block_ref_time_us;
 // The interrupt's time and the sample index the DMA had reached then, for timing a sample index.
 static uint64_t irq_us, irq_index;
 static uint32_t irqs, decode_us;
+static uint32_t inv_cycles, dec_cycles, dec_ev[PMU_N_EVENTS];
 static bool monitor;
 
 static uint32_t micros(void) {
@@ -242,17 +244,26 @@ static void dma_irq(void) {
     }
     uint32_t cur = off / CHUNK_BYTES;
     irqs++;
+    uint32_t c0 = pmu_cycles();
     while (next_chunk != cur) {
         data_invalidate(&ring[next_chunk * CHUNK_WORDS], CHUNK_BYTES);
         cap_end += CHUNK_WORDS * 32u;
         next_chunk = (next_chunk + 1u) % CHUNKS;
     }
+    inv_cycles += pmu_cycles() - c0;
     irq_index = cap_end + (off % CHUNK_BYTES) / 4u * 32u;
     // A decoder that fell most of a ring behind gives up the old samples rather than read overwritten ones.
     if (cap_end - spdif_decode_needs(&dec, cap_end) > (CHUNKS - 2u) * CHUNK_WORDS * 32u) {
         spdif_decode_skip(&dec, cap_end - CHUNK_WORDS * 32u);
     }
+    pmu_snap_t a, b;
+    pmu_read(&a);
     spdif_decode_ring(&dec, ring, CHUNKS * CHUNK_WORDS, cap_end, on_subframe, NULL);
+    pmu_read(&b);
+    dec_cycles += b.cycles - a.cycles;
+    for (uint32_t i = 0; i < PMU_N_EVENTS; i++) {
+        dec_ev[i] += b.ev[i] - a.ev[i];
+    }
     decode_us += micros() - (uint32_t)irq_us;
     if (state != SPDIF_RX_STATE_NO_SIGNAL && (uint32_t)irq_us - last_block_us > DECODE_TIMEOUT_US) {
         lose_signal();
@@ -444,6 +455,12 @@ void spdif_rx_pi_status(spdif_rx_pi_status_t *out) {
         .fifo_used = fifo_used(), .irqs = irqs, .decode_us = decode_us, .pcm_cs = REG(PCM_CS),
         .dma_debug = dma_ch == 0xFF ? 0 : REG(DMA_DEBUG(dma_ch)) & 7u, .monitor = monitor,
     };
+    out->inv_cycles = inv_cycles;
+    out->dec_cycles = dec_cycles;
+    out->dec_inst = dec_ev[0];
+    out->dec_l1d_refill = dec_ev[2];
+    out->dec_l2d_refill = dec_ev[3];
+    out->dec_br_mispred = dec_ev[4];
     for (uint32_t i = 0; i < 8u; i++) {
         out->last[i] = fifo_buff[(wr_ptr + PTR_SPAN - 8u + i) % SPDIF_RX_FIFO_SIZE];
     }
