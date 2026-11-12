@@ -6,6 +6,7 @@
 
 #define MEASURE_RUNS 256u   // runs to find the longest (a preamble's 3 cells) before searching
 #define SEARCH_ERRORS 64u   // failed preambles before the cell length is measured again
+#define MAX_CELL_Q8 (40u << 8)  // the longest cell tracked (32 kHz is 30.5); SPDIF_RING_TAIL covers it
 
 void spdif_decode_reset(spdif_decoder_t *d) {
     *d = (spdif_decoder_t){0};
@@ -123,79 +124,103 @@ static void search(spdif_decoder_t *d, const uint32_t *ring, uint32_t mask, uint
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Tracking: two samples a time slot, at the cell centres
+// Tracking: one sample a time slot, at the centre of its second cell
 
-// The line level at sample p.
-static inline uint32_t level_at(const uint32_t *ring, uint32_t mask, uint32_t p) {
-    return (ring[(p >> 5) & mask] << (p & 31u)) >> 31;
+// The line level at sample r, counted from bit 31 of base[0]. The ring's tail keeps this from wrapping.
+static inline uint32_t level_at(const uint32_t *base, uint32_t r) {
+    return (base[r >> 5] << (r & 31u)) >> 31;
 }
 
-// The samples from p on that differ from `level`, as a 32-bit window with sample p in bit 31.
-static inline uint32_t changes_from(const uint32_t *ring, uint32_t mask, uint32_t p, uint32_t level) {
-    uint32_t w0 = ring[(p >> 5) & mask], sh = p & 31u;
-    uint32_t x = sh ? (w0 << sh) | (ring[((p >> 5) + 1u) & mask] >> (32u - sh)) : w0;
-    return x ^ (0u - level);
+// The 32 samples from r on, sample r in bit 31.
+static inline uint32_t window_at(const uint32_t *base, uint32_t r) {
+    uint32_t w0 = base[r >> 5], sh = r & 31u;
+    return sh ? (w0 << sh) | (base[(r >> 5) + 1u] >> (32u - sh)) : w0;
 }
 
-// Reads the subframe whose first edge is d->start. Returns 1 after emitting it, 0 if the ring does not
-// reach far enough yet, and -1 if it is not a subframe (the stream was lost).
-static int track_one(spdif_decoder_t *d, const uint32_t *ring, uint32_t mask, uint64_t end, spdif_emit_fn emit,
-                     void *ctx) {
-    uint32_t s = d->start, c = d->cell_q8;
-    uint32_t need = s + ((65u * c) >> 8) + 64u;    // through the next preamble's edge, with window slack
-    if ((int32_t)((uint32_t)end - need) < 0) {
-        return 0;
-    }
-    // Centres of the eight cells after an anchor, the same for the whole subframe.
-    uint32_t off[8];
-    for (uint32_t j = 0; j < 8u; j++) {
-        off[j] = ((2u * j + 1u) * c) >> 9;
-    }
-    // The preamble's eight cells, read so the first is 1: B 11101000, M 11100010, W 11100100.
-    uint32_t flip = level_at(ring, mask, s + off[0]) ^ 1u, pat = 0;
-    for (uint32_t j = 0; j < 8u; j++) {
-        pat = pat << 1 | (level_at(ring, mask, s + off[j]) ^ flip);
-    }
-    uint32_t word = pat == 0xE8u ? SPDIF_SYNC_B : pat == 0xE2u ? SPDIF_SYNC_M : pat == 0xE4u ? SPDIF_SYNC_W : 0u;
-    if (!word) {
-        return -1;
-    }
-    uint32_t prev = (pat & 1u) ^ flip;
-    uint32_t anchor = s, limit = c >> 8;
-    // Seven groups of four time slots, each anchored on its first slot's leading edge, then the next
-    // preamble's edge. Every slot starts with a level change, so its first cell is the inverse of the
-    // cell before; only the second is read, and a 1 is a second cell equal to the cell before the slot.
+// Reads the subframe whose first edge is sample a of base[]. The low word is the level of each slot's
+// second cell in bits 31:4 and of preamble cells 7, 1, 3 and 5 in bits 3:0, or 0 if an edge was missing.
+// The high word is preamble cells 0, 2, 4 and 6 in bits 7:4 and the next subframe's first edge above.
+#if defined(__arm__) && !defined(__thumb__) && !defined(SPDIF_DECODE_PORTABLE)
+uint64_t spdif_read_levels(const uint32_t *base, uint32_t a, uint32_t c);     // spdif_decode_a32.S
+#else
+uint64_t spdif_read_levels(const uint32_t *base, uint32_t a, uint32_t c) {
+    // Centres of the second, fourth, sixth and eighth cell after an anchor, the same for every group.
+    uint32_t off1 = (3u * c) >> 9, off3 = (7u * c) >> 9, off5 = (11u * c) >> 9, off7 = (15u * c) >> 9;
+    uint32_t limit = c >> 8;
+    uint32_t pre = level_at(base, a + (c >> 9)) << 7 | level_at(base, a + ((5u * c) >> 9)) << 6 |
+                   level_at(base, a + ((9u * c) >> 9)) << 5 | level_at(base, a + ((13u * c) >> 9)) << 4;
+    uint32_t lv = level_at(base, a + off1) << 2 | level_at(base, a + off3) << 1 | level_at(base, a + off5);
+    // Eight anchors, each the level change that starts a group of four slots (the last starts the next
+    // preamble). The window that finds it starts on the cell before, which is the previous group's
+    // fourth slot or the preamble's last cell.
     for (uint32_t g = 0; g < 8u; g++) {
-        uint32_t from = anchor + off[7];
-        uint32_t t = changes_from(ring, mask, from, prev);
+        uint32_t from = a + off7;
+        uint32_t x = window_at(base, from);
+        uint32_t t = x ^ (uint32_t)((int32_t)x >> 31);
         uint32_t edge = t ? (uint32_t)__builtin_clz(t) : 32u;
         if (edge > limit) {
-            return -1;
+            return 0;
         }
-        anchor = from + edge;
+        lv |= (x >> 31) << (3u + 4u * g);
+        a = from + edge;
         if (g == 7u) {
             break;
         }
-        uint32_t b0 = level_at(ring, mask, anchor + off[1]);
-        uint32_t b1 = level_at(ring, mask, anchor + off[3]);
-        uint32_t b2 = level_at(ring, mask, anchor + off[5]);
-        uint32_t b3 = level_at(ring, mask, anchor + off[7]);
-        uint32_t bits = (b0 ^ prev ^ 1u) | (b1 ^ b0 ^ 1u) << 1 | (b2 ^ b1 ^ 1u) << 2 | (b3 ^ b2 ^ 1u) << 3;
-        word |= bits << (4u + 4u * g);
-        prev = b3;
+        lv |= level_at(base, a + off1) << (4u + 4u * g) | level_at(base, a + off3) << (5u + 4u * g) |
+              level_at(base, a + off5) << (6u + 4u * g);
     }
-    emit(word, full_index(end, s), ctx);
-    d->subframes++;
-    // 64 cells exactly: follow the source's rate and the sampling clock from every subframe.
-    uint32_t span = anchor - s;
-    set_cell(d, c + (uint32_t)((int32_t)((span << 2) - c) >> 3));
-    d->start = anchor;
-    return 1;
+    return (uint64_t)(a << 8 | pre) << 32 | lv;
+}
+#endif
+
+// The sync code of a preamble's eight cells in the order read_levels leaves them (0, 2, 4, 6, 7, 1, 3,
+// 5), either way up: B is 11101000, M 11100010 and W 11100100. Anything else is 0.
+static const uint8_t sync_of[256] = {
+    [0xE4] = SPDIF_SYNC_B, [0x1B] = SPDIF_SYNC_B, [0xD4] = SPDIF_SYNC_M,
+    [0x2B] = SPDIF_SYNC_M, [0xC5] = SPDIF_SYNC_W, [0x3A] = SPDIF_SYNC_W,
+};
+
+// Reads subframes from d->start on and emits them. Returns 0 when the ring does not reach far enough
+// for the next one, and -1 when what is there is not a subframe (the stream was lost).
+static int track(spdif_decoder_t *d, const uint32_t *ring, uint32_t mask, uint64_t end, spdif_emit_fn emit,
+                 void *ctx) {
+    uint32_t s = d->start, c = d->cell_q8, n = 0;
+    int r = 0;
+    for (;;) {
+        uint32_t need = s + ((65u * c) >> 8) + 64u;    // through the next preamble's edge, with window slack
+        if ((int32_t)((uint32_t)end - need) < 0) {
+            break;
+        }
+        r = -1;
+        if (c > MAX_CELL_Q8) {
+            break;      // reads would run past the ring's tail
+        }
+        uint32_t a0 = s & 31u;
+        uint64_t got = spdif_read_levels(ring + ((s >> 5) & mask), a0, c);
+        uint32_t lv = (uint32_t)got, hi = (uint32_t)(got >> 32);
+        uint32_t sync = sync_of[(hi & 0xF0u) | (lv & 0xFu)];
+        if (!lv || !sync) {
+            break;
+        }
+        // Every slot starts with a level change, so a 1 is a second cell equal to the slot before's.
+        emit((~(lv ^ lv << 1) & 0xFFFFFFF0u) | sync, full_index(end, s), ctx);
+        n++;
+        // 64 cells exactly: follow the source's rate and the sampling clock from every subframe.
+        uint32_t span = (hi >> 8) - a0;
+        c += (uint32_t)((int32_t)((span << 2) - c) >> 3);
+        s += span;
+        r = 0;
+    }
+    d->start = s;
+    d->cell_q8 = c;
+    d->subframes += n;
+    return r;
 }
 
 static void lose(spdif_decoder_t *d, uint64_t end) {
     d->errors++;
     d->tracking = 0;
+    set_cell(d, d->cell_q8);    // tracking moves the cell alone
     d->pos = full_index(end, (d->start & ~31u) + 32u);     // past the failed preamble's first edge
     d->have_edge = 0;
     d->npre = 0;
@@ -208,11 +233,7 @@ void spdif_decode_ring(spdif_decoder_t *d, const uint32_t *ring, uint32_t ring_w
     uint32_t mask = ring_words - 1u;
     for (;;) {
         if (d->tracking) {
-            int r = track_one(d, ring, mask, end, emit, ctx);
-            if (r > 0) {
-                continue;
-            }
-            if (r == 0) {
+            if (track(d, ring, mask, end, emit, ctx) == 0) {
                 return;
             }
             lose(d, end);
@@ -229,6 +250,9 @@ uint64_t spdif_decode_needs(const spdif_decoder_t *d, uint64_t end) {
 }
 
 void spdif_decode_skip(spdif_decoder_t *d, uint64_t from) {
+    if (d->tracking) {
+        set_cell(d, d->cell_q8);
+    }
     d->tracking = 0;
     d->pos = from;
     d->have_edge = 0;

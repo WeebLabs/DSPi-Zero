@@ -720,12 +720,13 @@ DSPi's S/PDIF input now runs on the Pi. `spdif_input.c` and `input_servo.c` are 
 
 **Wiring.** The source's optical receiver module is powered from 3.3 V, and its output goes to GPIO 20 (PCM_DIN, header pin 38). DSPi's stored S/PDIF input pin is bookkeeping only, as the output pins are.
 
-**Capture.** The PCM block is clock and frame master, with two 32-bit receive channels filling each 64-bit frame, so every PCM clock is one sample of the line. The clock is PLLD / 4 = 125 MHz, which input tracking never moves. Only GPIO 20 is routed; the clock and frame stay inside the block. A DMA loop fills a 128 KB ring of eight chunks of about 1 ms, and each chunk's interrupt decodes it.
+**Capture.** The PCM block is clock and frame master, with two 32-bit receive channels filling each 64-bit frame, so every PCM clock is one sample of the line. The clock is PLLD / 4 = 125 MHz, which input tracking never moves. Only GPIO 20 is routed; the clock and frame stay inside the block. A DMA loop fills a 128 KB ring of eight chunks of about 1 ms, and each chunk's interrupt decodes it. After the ring come 96 words that repeat its start, copied when the first chunk completes, so the decoder reads a subframe that starts near the ring's end without wrapping.
 
-**Decoding** (`spdif_decode.c`, tested on the Mac by `tests/spdif_decode_test.c`).
+**Decoding** (`spdif_decode.c` and `spdif_decode_a32.S`, tested by `tests/spdif_decode_test.c` and `tests/spdif_decode_a32_test.c`).
 - **Finding the stream:** the decoder times level changes, measures the cell from the longest runs, and looks for two preambles 64 cells apart. Their spacing gives the cell length precisely.
-- **Tracking:** every time slot starts with a level change, so a slot's first cell is the inverse of the cell before it, and only the second cell's centre is read: a 1 is a second cell equal to the cell before the slot. The decoder re-anchors on a slot's leading edge every 8 cells, using one count-leading-zeros on a 32-sample window. If an anchor edge is missing, or a subframe does not start with a valid preamble, the stream counts as lost and the search starts again. Parity errors are counted, not dropped, as by the RP2350's library.
+- **Tracking:** every time slot starts with a level change, so a slot's first cell is the inverse of the cell before it, and only the second cell's centre is read: a 1 is a second cell equal to the second cell of the slot before. The decoder re-anchors on a slot's leading edge every 8 cells, using one count-leading-zeros on a 32-sample window. That window starts on the centre of the cell before the edge, which is the fourth slot's sample, so each group of four slots costs three single samples and one window. If an anchor edge is missing, or a subframe does not start with a valid preamble, the stream counts as lost and the search starts again. Parity errors are counted, not dropped, as by the RP2350's library.
 - **Mac test:** subframes decode exactly at 44.1, 48 and 96 kHz, clean and with ±0.2 cells of edge jitter (16 ns at 96 kHz). At 62.5 MHz sampling, 96 kHz with that jitter fails, so the sampling stays at 125 MHz.
+- **Assembly:** on the Pi, the part that reads one subframe's samples is `spdif_decode_a32.S`. It returns exactly what the C version in `spdif_decode.c` returns, which the Mac test uses. `tests/spdif_decode_a32_test.c` compares the two on 200000 random reads under QEMU, and `tests/spdif_decode_test.c` also passes there with the assembly in place.
 
 **Library behaviour.** Blocks of 384 subframes start at a B preamble. Four aligned blocks at one rate make the receiver STABLE and call DSPi's lock callback. A misaligned block, a rate change, or 10 ms without a block loses the lock. The FIFO is DSPi's input capture arena. Block timestamps come from each block's sample position, referred to the chunk interrupt's system-timer time, so the servo's long-window rate uses the crystal's time base, as on the RP2350.
 
@@ -737,18 +738,32 @@ DSPi's S/PDIF input now runs on the Pi. `spdif_input.c` and `input_servo.c` are 
 - **Tracking:** DSPi's servo held the PLLA trim at -43.2 to -43.9 ppm, following the source's clock. The trim returned to exactly 0 on the switch back to USB.
 - **No signal:** with nothing connected, the receiver reports no signal, DSPi reports acquiring, and USB playback is clean afterwards.
 
-**Cost.** The decoding interrupt takes 6.96% of the CPU at 48 kHz, 644 cycles a subframe. The CPU's performance counters showed decoding is bound by instructions, not memory: about 2.5 L2 refills a subframe. The cost came down in four steps.
+**Cost.** The decoding interrupt takes 2.59% of the CPU at 48 kHz: 251 cycles a subframe decoding and 14 dropping each chunk from the cache. The cost came down in these steps, each measured on the board with the 48 kHz source.
 
-| Version | CPU at 48 kHz | Cycles a subframe |
-|---|---|---|
-| Every level change timed and sorted | 27.5% | |
-| Two samples a slot at the cell centres | 13.9% | 1368 |
-| The same, with offsets worked out once a subframe and each group of four slots unrolled | 10.1% | 968 |
-| One sample a slot | 6.96% | 644 |
+| Version | CPU at 48 kHz | Cycles a subframe | Instructions |
+|---|---|---|---|
+| Every level change timed and sorted | 27.5% | | |
+| Two samples a slot at the cell centres | 13.9% | 1368 | 1297 |
+| The same, with offsets worked out once a subframe and each group of four slots unrolled | 10.1% | 968 | 967 |
+| One sample a slot | 6.96% | 644 | 675 |
+| The ring's tail (no index masking), the anchor window's first sample used as the fourth slot's, the sync code from a table | 5.49% | 490 | 586 |
+| The subframe reader in assembly | 4.55% | 392 | 419 |
+| The same without negative index loads | | 371 | 418 |
+| Its instructions reordered for the Cortex-A53 (first attempt) | 3.86% | 320 | 431 |
+| One tracking loop, and a leaner per-subframe callback | 3.58% | 290 | 399 |
+| Chunks dropped from the cache with DCIMVAC (78 to 14 cycles a subframe) | 2.96% | 290 | 399 |
+| Instructions reordered again from measured timings | 2.74% | 267 | 399 |
+| The reader's results returned in registers, block start out of the callback, a better predicted C-bit test | 2.59% | 251 | 396 |
 
-The last step gives up checking every slot boundary: a slip shows at the next anchor, at most four slots on, or at the next preamble. Thirty seconds of the 48 kHz source decoded with no decode or parity errors. Invalidating each chunk from the cache adds 77 cycles a subframe. With nothing connected, the search reads every word, which costs about 4.8%. DSPi Console's CPU figure includes the decoding (section 24).
+- **One sample a slot** gives up checking every slot boundary: a slip shows at the next anchor, at most four slots on, or at the next preamble.
+- **Cache.** The decoder never writes a chunk, so its lines are never dirty and can be invalidated without cleaning. `data_invalidate` cleans as well, which cost 78 cycles a subframe.
+- **Instruction order.** The assembly's first version ran at about one instruction a cycle. Small loops timed on the board showed why: the Cortex-A53 issues two instructions a cycle in program order, with one load and one shift by register among them, and a value is ready later for some uses than for others (a load's word after 3 cycles, a result after 1 cycle as a plain operand, 2 as a shifted operand and 3 as an address). An instruction whose input is not ready holds back everything behind it. Each group of four slots is 32 instructions, placed so that every cycle issues two: 16 cycles a group, as measured in a loop.
+- **Where the rest goes.** Called a second time on the same subframe, the reader takes 172 cycles for 308 instructions. The other 79 cycles are the tracking loop, the callback that builds blocks and fills the FIFO, and the calls between them.
+- **Tried, not kept.** Software prefetch ahead of the reader saved 3 cycles. Checking the edge limit with a sticky saturation flag instead of a branch, and comparing against a distance register instead of a loaded limit, were no faster in the timed loop.
 
-**Not covered.** The source was 48 kHz only. 44.1 and 96 kHz from a real source, unplugging and replugging, and a source changing rate are untested. 96 kHz should roughly double the decoding cost. ADAT input is not started.
+The source decoded for 60 seconds with no decode or parity errors. With nothing connected, the search reads every word; that cost about 4.8% before the cheaper cache invalidation and has not been measured since. DSPi Console's CPU figure includes the decoding (section 24).
+
+**Not covered.** The source was 48 kHz only. 44.1 and 96 kHz from a real source, unplugging and replugging, and a source changing rate are untested. 96 kHz should roughly double the decoding cost, and the edge-jitter cases have only run in the Mac and QEMU tests. ADAT input is not started.
 
 ## 24. A CPU figure that counts the whole core
 

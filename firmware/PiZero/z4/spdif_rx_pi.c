@@ -67,7 +67,9 @@ typedef struct {
 } dma_cb_t;
 
 static dma_cb_t cbs[CHUNKS] __attribute__((section(".nocache"), aligned(32)));
-static uint32_t ring[CHUNKS * CHUNK_WORDS] __attribute__((aligned(64)));
+#define RING_WORDS (CHUNKS * CHUNK_WORDS)
+// The DMA fills RING_WORDS; the tail after them repeats the ring's start for the decoder.
+static uint32_t ring[RING_WORDS + SPDIF_RING_TAIL] __attribute__((aligned(64)));
 
 #define fifo_buff (input_capture_arena.spdif_fifo)
 _Static_assert(((CHUNKS * CHUNK_WORDS) & (CHUNKS * CHUNK_WORDS - 1u)) == 0, "the decoder's ring is a power of two");
@@ -89,21 +91,23 @@ static uint32_t stable_run;
 static uint32_t parity_err_count;
 static uint8_t c_bits[SPDIF_BLOCK_SIZE / 16];
 
-// The block being assembled, from a B preamble: 384 subframes alternating B or M, then W.
-static uint32_t blk_pos = SPDIF_BLOCK_SIZE;
-static bool blk_ok;
-static uint64_t blk_at, prev_blk_at;
-static uint32_t blk_parity;
-static uint8_t blk_c[SPDIF_BLOCK_SIZE / 16];
+// What every subframe touches, together so one base address reaches it all. The block being assembled
+// starts at a B preamble: 384 subframes alternating B or M, then W. The FIFO's write and read pointers
+// count modulo twice the FIFO, as pico_spdif_rx's do, so full and empty differ.
+#define PTR_SPAN (SPDIF_RX_FIFO_SIZE * 2u)
+static struct {
+    uint32_t blk_pos, blk_parity;
+    volatile uint32_t wr_ptr, rd_ptr;
+    uint64_t blk_at;
+    bool blk_ok;
+    uint8_t blk_c[SPDIF_BLOCK_SIZE / 16];
+} rx = {.blk_pos = SPDIF_BLOCK_SIZE};
+static uint64_t prev_blk_at;
 static uint32_t block_count;
 static uint32_t last_block_us;
 
-// Write and read pointers count modulo twice the FIFO, as pico_spdif_rx's do, so full and empty differ.
-#define PTR_SPAN (SPDIF_RX_FIFO_SIZE * 2u)
-static volatile uint32_t wr_ptr, rd_ptr;
-
 static inline uint32_t fifo_used(void) {
-    return (wr_ptr + PTR_SPAN - rd_ptr) % PTR_SPAN;
+    return (rx.wr_ptr + PTR_SPAN - rx.rd_ptr) % PTR_SPAN;
 }
 
 static volatile uint32_t block_ref_seq, block_ref_count;
@@ -148,28 +152,28 @@ static void lose_signal(void) {
     bool was_stable = state == SPDIF_RX_STATE_STABLE;
     state = SPDIF_RX_STATE_NO_SIGNAL;
     stable_run = 0;
-    blk_pos = SPDIF_BLOCK_SIZE;
+    rx.blk_pos = SPDIF_BLOCK_SIZE;
     prev_blk_at = 0;
     if (was_stable && on_lost_stable_func) {
         on_lost_stable_func();
     }
 }
 
-static void block_done(void) {
-    float hz = prev_blk_at ? (float)(SPDIF_BLOCK_SIZE / 2) * (float)SAMPLE_HZ / (float)(blk_at - prev_blk_at) : 0.0f;
-    prev_blk_at = blk_at;
+static __attribute__((noinline)) void block_done(void) {
+    float hz = prev_blk_at ? (float)(SPDIF_BLOCK_SIZE / 2) * (float)SAMPLE_HZ / (float)(rx.blk_at - prev_blk_at) : 0.0f;
+    prev_blk_at = rx.blk_at;
     spdif_rx_samp_freq_t sf = classify(hz);
     samp_freq_actual = hz;
-    parity_err_count += blk_parity;
+    parity_err_count += rx.blk_parity;
     block_count++;
     last_block_us = (uint32_t)irq_us;
     block_ref_seq++;
     __asm__ volatile("dmb" ::: "memory");
     block_ref_count = block_count;
-    block_ref_time_us = time_of(blk_at);
+    block_ref_time_us = time_of(rx.blk_at);
     __asm__ volatile("dmb" ::: "memory");
     block_ref_seq++;
-    if (!blk_ok || sf == SAMP_FREQ_NONE || (state == SPDIF_RX_STATE_STABLE && sf != samp_freq)) {
+    if (!rx.blk_ok || sf == SAMP_FREQ_NONE || (state == SPDIF_RX_STATE_STABLE && sf != samp_freq)) {
         if (state == SPDIF_RX_STATE_STABLE) {
             lose_signal();
         }
@@ -177,7 +181,7 @@ static void block_done(void) {
         stable_run = 0;
         return;
     }
-    memcpy(c_bits, blk_c, sizeof(c_bits));
+    memcpy(c_bits, rx.blk_c, sizeof(c_bits));
     stable_run = sf == samp_freq ? stable_run + 1u : 1u;
     samp_freq = sf;
     if (state == SPDIF_RX_STATE_NO_SIGNAL) {
@@ -191,45 +195,62 @@ static void block_done(void) {
     }
 }
 
+// A B preamble starts a block. Kept out of on_subframe so the other 383 subframes of a block run
+// without a stack frame.
+static __attribute__((noinline)) void block_start(uint64_t at) {
+    if (rx.blk_pos != SPDIF_BLOCK_SIZE) {
+        stable_run = 0;     // a B inside a block: the stream slipped
+        if (state == SPDIF_RX_STATE_STABLE) {
+            lose_signal();
+        }
+    }
+    rx.blk_ok = true;
+    rx.blk_at = at;
+    rx.blk_parity = 0;
+    memset(rx.blk_c, 0, sizeof(rx.blk_c));
+}
+
 static void on_subframe(uint32_t w, uint64_t at, void *ctx) {
     (void)ctx;
-    uint32_t sync = w & 0xFu;
+    uint32_t sync = w & 0xFu, pos = rx.blk_pos;
     if (sync == SPDIF_SYNC_B) {
-        if (blk_pos != SPDIF_BLOCK_SIZE) {
-            stable_run = 0;     // a B inside a block: the stream slipped
-            if (state == SPDIF_RX_STATE_STABLE) {
-                lose_signal();
-            }
-        }
-        blk_pos = 0;
-        blk_ok = true;
-        blk_at = at;
-        blk_parity = 0;
-        memset(blk_c, 0, sizeof(blk_c));
-    } else if (blk_pos == SPDIF_BLOCK_SIZE) {
+        block_start(at);
+        pos = 0;
+    } else if (pos == SPDIF_BLOCK_SIZE) {
         return;     // waiting for the next block's B
-    }
-    bool even = (blk_pos & 1u) == 0u;
-    if (even ? (sync == SPDIF_SYNC_W || (sync == SPDIF_SYNC_B && blk_pos)) : sync != SPDIF_SYNC_W) {
-        blk_ok = false;
+    } else if ((pos & 1u) ? sync != SPDIF_SYNC_W : sync == SPDIF_SYNC_W) {
+        rx.blk_ok = false;     // an M where a W belongs, or the reverse
     }
     uint32_t v = w & 0xFFFFFFF0u;     // even parity over time slots 4 to 31
-    v ^= v >> 1;
-    v ^= v >> 2;
-    v = (v & 0x11111111u) * 0x11111111u;
-    blk_parity += (v >> 28) & 1u;
-    if (even && (w >> 30 & 1u)) {
-        blk_c[blk_pos / 16u] |= (uint8_t)(1u << ((blk_pos / 2u) % 8u));
+    v ^= v >> 16;
+    v ^= v >> 8;
+    v ^= v >> 4;
+    rx.blk_parity += (0x6996u >> (v & 0xFu)) & 1u;
+    if ((w & 0x40000000u) && !(pos & 1u)) {     // the C bit, from the frame's first subframe
+        rx.blk_c[pos / 16u] |= (uint8_t)(1u << ((pos / 2u) % 8u));
     }
-    // A reader that has fallen a whole FIFO behind loses its oldest pair.
-    if (fifo_used() >= SPDIF_RX_FIFO_SIZE) {
-        rd_ptr = (rd_ptr + 2u) % PTR_SPAN;
+    // A reader that has fallen a whole FIFO behind loses its oldest pair. Both pointers stay below
+    // PTR_SPAN, so each wrap is one subtraction.
+    uint32_t wr = rx.wr_ptr, rd = rx.rd_ptr;
+    if ((wr >= rd ? wr - rd : wr + PTR_SPAN - rd) >= SPDIF_RX_FIFO_SIZE) {
+        rd += 2u;
+        rx.rd_ptr = rd >= PTR_SPAN ? rd - PTR_SPAN : rd;
     }
-    fifo_buff[wr_ptr % SPDIF_RX_FIFO_SIZE] = w;
-    wr_ptr = (wr_ptr + 1u) % PTR_SPAN;
-    if (++blk_pos == SPDIF_BLOCK_SIZE) {
+    fifo_buff[wr >= SPDIF_RX_FIFO_SIZE ? wr - SPDIF_RX_FIFO_SIZE : wr] = w;
+    rx.wr_ptr = wr + 1u == PTR_SPAN ? 0u : wr + 1u;
+    rx.blk_pos = ++pos;
+    if (pos == SPDIF_BLOCK_SIZE) {
         block_done();
     }
+}
+
+// Drops a chunk the DMA has rewritten from the cache. Chunks are whole cache lines that only the DMA
+// writes, so there is nothing to clean first, and discarding is cheaper than data_invalidate.
+static void chunk_invalidate(const uint32_t *chunk) {
+    for (uintptr_t a = (uintptr_t)chunk, end = a + CHUNK_BYTES; a < end; a += 64u) {
+        __asm__ volatile("mcr p15, 0, %0, c7, c6, 1" ::"r"(a));     // DCIMVAC
+    }
+    __asm__ volatile("dsb" ::: "memory");
 }
 
 static void dma_irq(void) {
@@ -239,14 +260,17 @@ static void dma_irq(void) {
     }
     irq_us = micros64();
     uint32_t off = REG(DMA_DEST(dma_ch)) - BUS(ring);
-    if (off >= sizeof(ring)) {
+    if (off >= RING_WORDS * 4u) {
         return;     // between control blocks; the next interrupt catches up
     }
     uint32_t cur = off / CHUNK_BYTES;
     irqs++;
     uint32_t c0 = pmu_cycles();
     while (next_chunk != cur) {
-        data_invalidate(&ring[next_chunk * CHUNK_WORDS], CHUNK_BYTES);
+        chunk_invalidate(&ring[next_chunk * CHUNK_WORDS]);
+        if (next_chunk == 0) {
+            memcpy(&ring[RING_WORDS], ring, SPDIF_RING_TAIL * 4u);
+        }
         cap_end += CHUNK_WORDS * 32u;
         next_chunk = (next_chunk + 1u) % CHUNKS;
     }
@@ -258,7 +282,7 @@ static void dma_irq(void) {
     }
     pmu_snap_t a, b;
     pmu_read(&a);
-    spdif_decode_ring(&dec, ring, CHUNKS * CHUNK_WORDS, cap_end, on_subframe, NULL);
+    spdif_decode_ring(&dec, ring, RING_WORDS, cap_end, on_subframe, NULL);
     pmu_read(&b);
     dec_cycles += b.cycles - a.cycles;
     for (uint32_t i = 0; i < PMU_N_EVENTS; i++) {
@@ -323,7 +347,7 @@ static void capture_start(void) {
         cbs[i] = (dma_cb_t){ti, PCM_FIFO_BUS, BUS(&ring[i * CHUNK_WORDS]), CHUNK_BYTES, 0,
                             BUS(&cbs[(i + 1u) % CHUNKS]), {0, 0}};
     }
-    data_invalidate(ring, sizeof(ring));
+    data_invalidate(ring, RING_WORDS * 4u);
     __asm__ volatile("dsb" ::: "memory");
     spdif_decode_reset(&dec);
     next_chunk = 0;
@@ -353,9 +377,9 @@ void spdif_rx_start(const spdif_rx_config_t *config) {
     samp_freq_actual = 0.0f;
     stable_run = 0;
     parity_err_count = 0;
-    blk_pos = SPDIF_BLOCK_SIZE;
+    rx.blk_pos = SPDIF_BLOCK_SIZE;
     prev_blk_at = 0;
-    wr_ptr = rd_ptr = 0;
+    rx.wr_ptr = rx.rd_ptr = 0;
     block_count = 0;
     last_block_us = micros();
     memset(c_bits, 0, sizeof(c_bits));
@@ -427,12 +451,12 @@ static uint32_t read_fifo(uint32_t **buff, uint32_t req_count, bool live) {
     uint32_t save = irq_global_disable();
     uint32_t avail = (live ? spdif_rx_get_fifo_count_live() : spdif_rx_get_fifo_count()) & ~1u;
     uint32_t n = req_count < avail ? req_count : avail;
-    uint32_t at = rd_ptr % SPDIF_RX_FIFO_SIZE;
+    uint32_t at = rx.rd_ptr % SPDIF_RX_FIFO_SIZE;
     if (at + n > SPDIF_RX_FIFO_SIZE) {
         n = SPDIF_RX_FIFO_SIZE - at;
     }
     *buff = &fifo_buff[at];
-    rd_ptr = (rd_ptr + n) % PTR_SPAN;
+    rx.rd_ptr = (rx.rd_ptr + n) % PTR_SPAN;
     irq_global_restore(save);
     return n;
 }
@@ -462,7 +486,7 @@ void spdif_rx_pi_status(spdif_rx_pi_status_t *out) {
     out->dec_l2d_refill = dec_ev[3];
     out->dec_br_mispred = dec_ev[4];
     for (uint32_t i = 0; i < 8u; i++) {
-        out->last[i] = fifo_buff[(wr_ptr + PTR_SPAN - 8u + i) % SPDIF_RX_FIFO_SIZE];
+        out->last[i] = fifo_buff[(rx.wr_ptr + PTR_SPAN - 8u + i) % SPDIF_RX_FIFO_SIZE];
     }
     irq_global_restore(save);
 }

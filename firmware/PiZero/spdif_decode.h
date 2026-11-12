@@ -2,11 +2,15 @@
 
 // S/PDIF decoder over a line sampled into a power-of-two ring of 32-bit words, first sample in bit 31.
 // It finds the stream by timing level changes until two preambles a subframe apart measure the cell,
-// then reads each time slot from two samples at its cell centres, re-anchoring on a slot edge every 8
-// cells. Subframes come out in pico_spdif_rx's word layout. No hardware is touched here.
+// then reads each time slot from one sample at the centre of its second cell, re-anchoring on a slot
+// edge every 8 cells. Subframes come out in pico_spdif_rx's word layout. No hardware is touched here.
 
 #include <stdbool.h>
 #include <stdint.h>
+
+// Words the caller keeps after the ring's end as a copy of its first words, so a subframe that starts
+// near the end is read without wrapping.
+#define SPDIF_RING_TAIL 96u
 
 #define SPDIF_SYNC_B 0xFu   // sync codes in bits 3:0, as pico_spdif_rx writes them
 #define SPDIF_SYNC_M 0xBu
@@ -24,7 +28,7 @@ typedef struct {
     uint32_t have_edge;     // search: last_edge is valid
     uint32_t level;         // search: line level after the last sample read
     uint32_t cell_q8;       // one cell in samples, 8 fractional bits; 0 until measured
-    uint32_t th[4];         // 0.5, 1.5, 2.5 and 3.5 cells, the same units
+    uint32_t th[4];         // search: 0.5, 1.5, 2.5 and 3.5 cells, the same units
     uint32_t longest;       // search: longest run while measuring
     uint32_t runs_seen;     // search: runs seen while measuring
     uint32_t npre;          // search: runs of a possible preamble so far
@@ -38,7 +42,8 @@ typedef struct {
 
 void spdif_decode_reset(spdif_decoder_t *d);
 // Decodes what the ring holds up to sample `end` (exclusive, a word boundary). ring_words is a power of
-// two, and the ring must still hold every sample from the decoder's position to end.
+// two, the ring must still hold every sample from the decoder's position to end, and its tail must
+// already copy any of the first SPDIF_RING_TAIL words that lie before end.
 void spdif_decode_ring(spdif_decoder_t *d, const uint32_t *ring, uint32_t ring_words, uint64_t end,
                        spdif_emit_fn emit, void *ctx);
 // The oldest sample the decoder still needs, so a caller can tell when it has fallen too far behind.

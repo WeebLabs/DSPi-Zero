@@ -1,6 +1,7 @@
 // Host test for spdif_decode.c: encodes known stereo samples as S/PDIF (preambles, biphase-mark, parity),
 // samples the line at 125 MHz with random edge jitter, decodes, and checks every subframe.
 // Build and run (any scratch path): cc -O2 -I.. -o sdt spdif_decode_test.c ../spdif_decode.c && ./sdt
+// That runs the C reader; spdif_decode_a32_test.c covers the ARM assembly one.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,7 +96,7 @@ static int run(uint32_t rate, double jitter_cells, uint32_t frames, uint64_t see
     spdif_decode_reset(&d);
     // Feed through a ring a chunk at a time, as the DMA does, with the ring's end moving in uneven steps.
     enum { RING_WORDS = 1u << 15 };
-    static uint32_t ring[RING_WORDS];
+    static uint32_t ring[RING_WORDS + SPDIF_RING_TAIL];
     uint64_t end = 0;
     for (uint32_t k = 0; k < nw;) {
         uint32_t m = 1 + rand() % 4096;
@@ -103,7 +104,11 @@ static int run(uint32_t rate, double jitter_cells, uint32_t frames, uint64_t see
             m = nw - k;
         }
         for (uint32_t j = 0; j < m; j++) {
-            ring[(k + j) & (RING_WORDS - 1u)] = words[k + j];
+            uint32_t at = (k + j) & (RING_WORDS - 1u);
+            ring[at] = words[k + j];
+            if (at < SPDIF_RING_TAIL) {
+                ring[RING_WORDS + at] = words[k + j];   // the tail the decoder reads past the end
+            }
         }
         k += m;
         end = (uint64_t)k * 32u;
