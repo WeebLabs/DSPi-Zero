@@ -20,7 +20,7 @@ git submodule update --init --recursive
 ```
 
 ```bash
-cd DSPi/firmware/pico-sdk/lib/tinyusb && python3 tools/get_deps.py broadcom_32bit
+(cd DSPi/firmware/pico-sdk/lib/tinyusb && python3 tools/get_deps.py broadcom_32bit)
 ```
 
 ```bash

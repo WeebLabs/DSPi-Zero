@@ -45,6 +45,7 @@
 #include "smi_out.h"
 #include "pcm_rx.h"
 #include "spdif_rx_pi.h"
+#include "cpu_meter.h"
 #include "clk_dump.h"
 #include "pll_out.h"
 #include "device/dcd.h"
@@ -142,7 +143,7 @@ typedef struct {
 _Static_assert(NUM_CHANNELS <= Z4_PEAK_SLOTS, "peaks[] holds every DSPi channel");
 
 typedef struct {
-    uint8_t cpu0_load;              // global_status.cpu0_load: DSPi's busy/budget EMA, percent
+    uint8_t cpu0_load;              // global_status.cpu0_load: whole-core load from cpu_meter.c, percent
     uint8_t cpu1_load;              // always 0, Core 1 is never started
     uint8_t core1_mode;
     uint8_t n_channels;             // valid entries in peaks[] (NUM_CHANNELS)
@@ -644,6 +645,15 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
                 uh.armed = 1;
             }
             return tud_control_xfer(rhport, req, &copy, req->wLength < sizeof(copy) ? req->wLength : sizeof(copy));
+        }
+        return true;
+    }
+    // 0x43: the whole-core CPU load DSPi Console shows, with its parts (cpu_meter.c).
+    if (bench && req->bRequest == 0x43 && in) {
+        static cpu_meter_status_t ms;
+        if (stage == CONTROL_STAGE_SETUP) {
+            cpu_meter_status(&ms);
+            return tud_control_xfer(rhport, req, &ms, req->wLength < sizeof(ms) ? req->wLength : sizeof(ms));
         }
         return true;
     }
@@ -1163,6 +1173,7 @@ void z4_service_producer(void) {
     uh.gaps_over_4ms += last && gap > 4000u;
     uh.tud_calls++;
     last = now;
+    cpu_meter_enter();
     tud_task();
     consume_task();
     input_delivery_mark();
@@ -1172,6 +1183,8 @@ void z4_service_producer(void) {
     siggen_pump();
     output_rings_idle_pump();
     notify_drain(0);
+    cpu_meter_leave(CPU_METER_PRODUCER);
+    cpu_meter_publish();    // after any block, whose own load figure DSPi has just written
 }
 
 bool z4_stream_running(void) {
@@ -1255,7 +1268,10 @@ int main(void) {
             smi_source_request = 0xFFFFFFFFu;
         }
         z4_service_producer();
+        cpu_meter_enter();
         z4_dspi_service();
+        cpu_meter_leave(CPU_METER_SERVICES);
+        cpu_meter_tick();
         uart_poll();
 
         if (reboot_requested) {

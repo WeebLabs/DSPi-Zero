@@ -737,7 +737,28 @@ DSPi's S/PDIF input now runs on the Pi. `spdif_input.c` and `input_servo.c` are 
 - **Tracking:** DSPi's servo held the PLLA trim at -43.2 to -43.9 ppm, following the source's clock. The trim returned to exactly 0 on the switch back to USB.
 - **No signal:** with nothing connected, the receiver reports no signal, DSPi reports acquiring, and USB playback is clean afterwards.
 
-**Cost.** The decoding interrupt takes 13.9% of the CPU at 48 kHz. About 4.8 points of that is reading 15.6 MB/s of samples, which is spent even with no signal. DSPi Console's CPU figure does not include it, because it counts only DSPi's own block processing. A first version that handled every level change took 27.5%.
+**Cost.** The decoding interrupt takes 13.9% of the CPU at 48 kHz. About 4.8 points of that is reading 15.6 MB/s of samples, which is spent even with no signal. DSPi Console's CPU figure includes it since section 24. A first version that handled every level change took 27.5%.
 
 **Not covered.** The source was 48 kHz only. 44.1 and 96 kHz from a real source, unplugging and replugging, and a source changing rate are untested. 96 kHz should roughly double the decoding cost. ADAT input is not started.
+
+## 24. A CPU figure that counts the whole core
+
+*Added: 2026-11-12*
+
+DSPi's own CPU figure (`global_status.cpu0_load`) is the time `process_input_block()` takes against the audio it handles. On the Pi much of the work happens elsewhere: the SMI composer and the S/PDIF decoder run in interrupts, and DSPi's services, such as the spectrum analyser, run in the main loop. `z4/cpu_meter.c` therefore replaces the figure with a whole-core one, which DSPi Console shows unchanged.
+
+**How it is measured.** The Cortex-A53 cycle counter times the producer (USB and input delivery, with DSPi's blocks) and DSPi's services. Each region counts its own time, less interrupts and less any region nested inside it, so a settle loop that runs the producer from the services is not counted twice. Every cycle in an interrupt handler counts. A main-loop call with under 3 us of its own work is polling, not load, and is left out. Every 500 ms the total, as a share of the window, becomes `cpu0_load`. It is also written after every producer call, so DSPi's per-block figure never shows through. Bench request `0x43` and `tools/cpu_check.py` show the parts.
+
+**Readings** (DSPi Console closed, 500 ms windows).
+
+| Case | Load | Interrupts | Producer | Services |
+|---|---|---|---|---|
+| USB input, no stream | 7.5% | 7.0% | 0.6% | 0.0% |
+| USB tone at 48 kHz | 13.8% | 8.3% | 4.0% | 1.4% |
+| USB tone at 96 kHz | 21.2% | 13.8% | 4.6% | 2.8% |
+| S/PDIF input at 48 kHz | 24.4% | 20.2% | 2.7% | 1.5% |
+
+`REQ_GET_STATUS` wValue 9, which DSPi Console reads, returned the same figure as the meter, rounded.
+
+**Polling left out.** The main loop runs about 270,000 passes a second, and the calls that find nothing to do take 50 to 65% of the core. That is waiting, which a sleeping loop would not spend, so it is not counted.
 
