@@ -28,3 +28,12 @@
 
 // The loader passes this in r3 when it starts an image, so startup.S can skip the sign-of-life flicker.
 #define LOADER_LAUNCH_MAGIC     0x4C4F4144u     // "LOAD"
+
+// A user's card carries the loader as a second file at LOADER_BASE beside DSPi (boot/config_card.txt). An
+// image asked to drop to the loader leaves this marker, and its complement in the next word, in RAM,
+// which the watchdog reset keeps. startup.S finds it on the restart and hands over to the loader before
+// touching any hardware. Images must stay below LOADER_HANDOFF_ADDR.
+#define LOADER_BASE             0x02000000u
+#define LOADER_HANDOFF_ADDR     0x01F00000u
+#define LOADER_HANDOFF_MAGIC    0x48414E44u     // "HAND"
+

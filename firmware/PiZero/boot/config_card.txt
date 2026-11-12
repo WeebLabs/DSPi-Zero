@@ -1,0 +1,14 @@
+# Boot config for a user's card (tools/make_sd_image.sh), Pi Zero 2 W: DSPi starts at power-up as the kernel,
+# and the USB loader comes along at 32 MB, for updates over USB (LOADER_HANDOFF_* in loader/loader_proto.h).
+kernel=kernel.img
+# pizero.ld links for 0x8000.
+kernel_address=0x8000
+# The loader, linked for 32 MB (pizero_loader.ld). DSPi starts it on a reboot asked for by pizero_load.py.
+initramfs loader.img 0x02000000
+# Our code programs the PL011 for 48 MHz before it can ask the mailbox.
+init_uart_clock=48000000
+enable_uart=1
+# bootcode.bin and start.elf print their own boot log on UART0 at 115200 before our code starts.
+uart_2ndstage=1
+# The image is 32-bit.
+arm_64bit=0

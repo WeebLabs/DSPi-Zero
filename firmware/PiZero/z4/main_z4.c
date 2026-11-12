@@ -21,6 +21,7 @@
 #include "broadcom/gen/vcmailbox.h"
 
 #include "loader_proto.h"
+#include "broadcom/caches.h"
 #include "usb_descriptors.h"
 
 #include "pico/audio_i2s_multi.h"
@@ -598,6 +599,22 @@ static void sensors_refresh(void) {
 
 static volatile uint32_t spdif_monitor_request = 0xFFFFFFFFu;    // bench 0x44, run from the main loop
 static volatile uint32_t smi_source_request = 0xFFFFFFFFu;     // bench 0x46 op 4, run from the main loop
+
+// On a card that carries the USB loader beside DSPi, the firmware placed the loader at LOADER_BASE; its first
+// instruction is startup.S's, the same as ours. The marker then sends the reboot to it. With no loader
+// there (the loader card starts it as the kernel anyway), the reboot is a plain one.
+static void arm_loader_handoff(void) {
+    extern const uint32_t _start[];
+    volatile uint32_t *loader = (volatile uint32_t *)LOADER_BASE;
+    if (loader[0] != _start[0]) {
+        return;
+    }
+    volatile uint32_t *m = (volatile uint32_t *)LOADER_HANDOFF_ADDR;
+    m[0] = LOADER_HANDOFF_MAGIC;
+    m[1] = ~LOADER_HANDOFF_MAGIC;
+    data_clean((void *)m, 8);
+    __asm__ volatile("dsb" ::: "memory");
+}
 
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req) {
     static u2_reply_t reply;
@@ -1280,6 +1297,7 @@ int main(void) {
             irq_global_disable();
             tud_disconnect();
             board_delay_us(50000);
+            arm_loader_handoff();
             board_reboot();
         }
 

@@ -22,10 +22,34 @@ _start:
     adr     r11, _start
 
 #if BCM_VERSION == 2837
-    /* Images started by the USB loader get r3 = LOADER_LAUNCH_MAGIC (loader/loader_proto.h) and skip this. */
+    /* A reboot meant for the USB loader leaves a marker (LOADER_HANDOFF_* in loader/loader_proto.h). An image
+     * the loader started (r3 = LOADER_LAUNCH_MAGIC) has been through the loader, so it clears any marker and
+     * skips the flicker below. Otherwise a marker means: clear it and start the loader the firmware placed at
+     * 0x2000000, with the firmware's r0-r2. The MMU and caches are off, so this is RAM itself. */
+    ldr     r4, =0x01F00000
+    mov     r5, #0
     ldr     r0, =0x4C4F4144
     cmp     r3, r0
+    streq   r5, [r4]
+    streq   r5, [r4, #4]
     beq     6f
+    ldr     r6, [r4]
+    ldr     r7, =0x48414E44
+    cmp     r6, r7
+    ldreq   r6, [r4, #4]
+    mvneq   r7, r7
+    cmpeq   r6, r7
+    bne     5f
+    str     r5, [r4]
+    str     r5, [r4, #4]
+    dsb
+    mov     r0, r8
+    mov     r1, r9
+    mov     r2, r10
+    mov     r3, #0
+    ldr     r4, =0x02000000
+    bx      r4
+5:
     /* Sign of life without a UART: 4 s of fast LED flicker (GPIO 29) before anything can hang, ending
      * with the pin high (LED off if active low), unlike the firmware's solid on. Uses r0-r7 only. */
     ldr     r0, =0x3F200000             /* GPIO */

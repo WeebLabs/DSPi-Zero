@@ -785,3 +785,20 @@ The S/PDIF row was taken before the decoder was made cheaper (section 23). It no
 
 **Check.** `tools/output_toggle_check.py` toggled random outputs, including outputs 3 to 8 and PDM, 400 times at 50 a second while a tone played. The board kept answering, `core1_mode` read 0 throughout, the stream ran with no late compositions, and the outputs were put back. The old image was not run against this test, to avoid another power cycle, so the cause comes from the code rather than from a reproduction.
 
+## 26. A card for users, with the USB loader on board
+
+*Added: 2026-11-12*
+
+`tools/make_sd_image.sh` builds `dspi-zero2w.img(.zip)`, a 64 MB card image with one FAT32 partition. It holds the GPU boot files with Broadcom's licence, `boot/config_card.txt` as `config.txt`, DSPi (`pizero_z4.img`) as `kernel.img`, the USB loader as `loader.img`, and a short README. It is built on a Mac with `hdiutil` and `diskutil`, with no root needed.
+
+**Boot.** The firmware starts DSPi at 0x8000 as the kernel, so a power-up never passes through the loader. `initramfs loader.img 0x02000000` has the firmware place the loader at 32 MB as well.
+
+**Reaching the loader.** On `APP_REQ_REBOOT_TO_LOADER`, DSPi checks that a loader is at `LOADER_BASE` (its first word is startup.S's first instruction, as DSPi's is). It then writes `LOADER_HANDOFF_MAGIC` and its complement at `LOADER_HANDOFF_ADDR` (31 MB), cleans them from the cache and resets the board. `startup.S` reads the marker first thing, with the MMU and caches off. If it is there, startup.S clears it and jumps to the loader with the firmware's r0 to r2. An image the loader started (r3 = `LOADER_LAUNCH_MAGIC`) clears any marker and goes on, so a loader that does not know the marker, like the one on the loader-only card, still works. With no loader in RAM the reboot is plain, as before.
+
+**On the board** (the image written with Raspberry Pi Imager):
+- DSPi enumerated on its own after power-up. All four slots decoded on the SMI, with PLLA locked as the audio clock.
+- `pizero_load.py` reached the loader in 7.1 and 7.4 s and started the image it sent, twice. So the marker survives the watchdog reset.
+- The loader's own reboot request brought DSPi back from the card in 6.1 s, 4 s of which is startup.S's LED flicker.
+
+An image sent over USB runs until the power is removed. Keeping it means copying it onto the card as `kernel.img`, because the loader cannot write the card.
+
