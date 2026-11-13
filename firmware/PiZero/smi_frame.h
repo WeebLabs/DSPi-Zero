@@ -2,7 +2,8 @@
 
 // One SMI frame (256 words) from four slots' ring frames, in NEON with no tables in the slot path. Each
 // slot becomes 128 line levels, one per S/PDIF cell time (2 SMI words); the four are bit-interleaved into
-// one nibble per cell by two rounds of polynomial squaring, then widened to words. Bring-up section 27.
+// one nibble per cell by two rounds of polynomial squaring, then widened to words. Bring-up sections 27
+// and 28.
 
 #include <arm_acle.h>
 #include <arm_neon.h>
@@ -14,9 +15,74 @@ enum { SMI_SLOT_OFF, SMI_SLOT_SPDIF, SMI_SLOT_I2S };
 #define SMI_FRAME_KEY_WORDS 16u     // what a frame was made from: 4 words a slot
 #define SMI_FRAME_ADAT_WORDS 8u
 
-// raw[s] is 4 words of slot s's ring: an S/PDIF frame's NRZI cells; for I2S the frame before's L and R,
-// then L and R (only the R before's LSB and L, R are sent); zeros for a slot that is off. adat is the
-// frame's 8 words of ADAT line levels, MSB first, one bit per SMI word on SD8, or NULL.
+// An S/PDIF slot ring holds two words a frame, left then right, which the composer encodes. A word has
+// one bit for each of its subframe's 32 time slots, stored so that a running XOR over the word gives the
+// line level in the second half of every slot. Biphase mark toggles the line at each slot's start and
+// again at its middle for a 1, so the sample and the V, U and C bits are stored inverted.
+#define SMI_SPDIF_PRE_LEFT 0x3u             // bits 0-3 of a left word (preamble X or Z)
+#define SMI_SPDIF_PRE_RIGHT 0xFu            // bits 0-3 of a right word (preamble Y)
+#define SMI_SPDIF_DATA_ZERO 0x3FFFFFF0u     // bits 4-27 a sample of 0, bits 28 and 29 V and U of 0
+#define SMI_SPDIF_NOT_C (1u << 30)          // a channel status bit of 0
+#define SMI_SPDIF_BLOCK_START (1u << 31)    // left word of a block's first frame (preamble Z)
+// The parity bit is not stored. It is whatever returns the line to the level the subframe began at.
+#define SMI_SPDIF_BLOCK 192u
+#define SMI_SPDIF_STRIDE 8u         // bytes a frame
+
+// A sample's bits in a ring word. XORed into a silent word they give the word for that sample.
+static inline uint32_t smi_spdif_sample(int32_t sample) {
+    return (uint32_t)sample << 8 >> 4;
+}
+
+// The silent frame for each phase of a channel-status block (5 bytes of status, the rest zeros), as DSPi's
+// RP2350 encoder sends it, with validity and user bits of 0 and the status bit in both subframes.
+static inline void smi_spdif_silence_init(uint32_t idle[SMI_SPDIF_BLOCK][2], const uint8_t status[5]) {
+    for (uint32_t phase = 0; phase < SMI_SPDIF_BLOCK; phase++) {
+        uint32_t c = phase < 40u ? (status[phase / 8u] >> (phase % 8u)) & 1u : 0u;
+        uint32_t data = SMI_SPDIF_DATA_ZERO | (c ? 0u : SMI_SPDIF_NOT_C);
+        idle[phase][0] = data | SMI_SPDIF_PRE_LEFT | (phase == 0 ? SMI_SPDIF_BLOCK_START : 0u);
+        idle[phase][1] = data | SMI_SPDIF_PRE_RIGHT;
+    }
+}
+
+// Ring frames w to w + n - 1 (w is the absolute frame number, whose block phase is w modulo 192) from n
+// stereo samples, or as silence when lr is NULL. ring_frames is a power of two.
+static inline void smi_spdif_write(uint32_t *ring, uint32_t ring_frames, const uint32_t idle[SMI_SPDIF_BLOCK][2],
+                                   uint32_t w, const int32_t *lr, uint32_t n) {
+    uint32_t phase = w % SMI_SPDIF_BLOCK;
+    while (n) {
+        uint32_t at = w & (ring_frames - 1u), run = n;
+        run = run < ring_frames - at ? run : ring_frames - at;
+        run = run < SMI_SPDIF_BLOCK - phase ? run : SMI_SPDIF_BLOCK - phase;
+        uint32_t *f = &ring[at * 2u];
+        const uint32_t *from = &idle[0][0] + 2u * phase;
+        uint32_t words = 2u * run, i = 0;
+        if (lr) {
+            for (; i + 4u <= words; i += 4u) {
+                uint32x4_t v = vshrq_n_u32(vshlq_n_u32(vreinterpretq_u32_s32(vld1q_s32(&lr[i])), 8), 4);
+                vst1q_u32(&f[i], veorq_u32(vld1q_u32(&from[i]), v));
+            }
+            for (; i < words; i++) {
+                f[i] = from[i] ^ smi_spdif_sample(lr[i]);
+            }
+            lr += words;
+        } else {
+            for (; i + 4u <= words; i += 4u) {
+                vst1q_u32(&f[i], vld1q_u32(&from[i]));
+            }
+            for (; i < words; i++) {
+                f[i] = from[i];
+            }
+        }
+        w += run;
+        n -= run;
+        phase = phase + run == SMI_SPDIF_BLOCK ? 0 : phase + run;
+    }
+}
+
+// raw[s] is 4 words of slot s's ring. For S/PDIF they are the frame's left and right words, then the
+// next frame's, which only the key takes in. For I2S they are the frame before's L and R, then L and R,
+// of which the R before's LSB and L, R are sent. A slot that is off has zeros. adat is the frame's 8
+// words of ADAT line levels, MSB first, one bit per SMI word on SD8, or NULL.
 typedef struct {
     const uint32_t *raw[4];
     uint32_t type[4];
@@ -37,21 +103,6 @@ uint32_t smi_frames_a32(uint16_t *dst, smi_frame_job_t *job, uint32_t *key, uint
 #define SMI_FRAME_BIT_BCK 4u
 #define SMI_FRAME_BIT_LRCLK 5u
 
-// NRZI cells (1 = toggle) to levels: a running XOR over the frame's 128 cells. Every subframe has an even
-// number of transitions, so each frame starts from the same level.
-static inline uint8x16_t smi_frame_levels_spdif(const uint32_t *w) {
-    uint64x2_t x = vreinterpretq_u64_u32(vld1q_u32(w));
-    x = veorq_u64(x, vshlq_n_u64(x, 1));
-    x = veorq_u64(x, vshlq_n_u64(x, 2));
-    x = veorq_u64(x, vshlq_n_u64(x, 4));
-    x = veorq_u64(x, vshlq_n_u64(x, 8));
-    x = veorq_u64(x, vshlq_n_u64(x, 16));
-    x = veorq_u64(x, vshlq_n_u64(x, 32));
-    uint64x1_t lo = vget_low_u64(x);
-    uint64x1_t carry = vreinterpret_u64_s64(vshr_n_s64(vreinterpret_s64_u64(lo), 63));
-    return vreinterpretq_u8_u64(vcombine_u64(lo, veor_u64(vget_high_u64(x), carry)));
-}
-
 static inline uint16x8_t smi_frame_square(uint8x8_t a) {    // bit i of each byte to bit 2i
     poly8x8_t p = vreinterpret_p8_u8(a);
     return vreinterpretq_u16_p16(vmull_p8(p, p));
@@ -59,6 +110,31 @@ static inline uint16x8_t smi_frame_square(uint8x8_t a) {    // bit i of each byt
 
 static inline uint16x8_t smi_frame_pair(uint16x8_t even, uint16x8_t odd) {  // interleaves two squares
     return vorrq_u16(even, vshlq_n_u16(odd, 1));
+}
+
+// One S/PDIF ring word to its 32 slots' levels, first halves in half[0] and second halves in half[1].
+// The running XOR is the second halves, and its bit 31 is the parity slot, which ends at the level the
+// subframe began at, 0. A first half is the level before it, inverted; the low 4 slots are the preamble.
+static inline void smi_frame_spdif_halves(uint32_t w, bool left, uint32_t half[2]) {
+    uint32_t x = w;
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    half[0] = ~(x << 1) ^ 6u ^ (left && w >> 31 ? 12u : 0u);
+    half[1] = x & 0x7FFFFFFFu;
+}
+
+// An S/PDIF frame's 128 levels from its left and right ring words. Every subframe has an even number of
+// transitions, so each starts from the same level.
+static inline uint8x16_t smi_frame_levels_spdif(const uint32_t *w) {
+    uint32_t l[2], r[2];
+    smi_frame_spdif_halves(w[0], true, l);
+    smi_frame_spdif_halves(w[1], false, r);
+    uint16x8_t first = smi_frame_square(vcreate_u8((uint64_t)r[0] << 32 | l[0]));
+    uint16x8_t second = smi_frame_square(vcreate_u8((uint64_t)r[1] << 32 | l[1]));
+    return vreinterpretq_u8_u16(smi_frame_pair(first, second));
 }
 
 // Philips I2S, 64 bit clocks of 2 cell times each: clock 0 is the last frame's right LSB, 1-32 the left

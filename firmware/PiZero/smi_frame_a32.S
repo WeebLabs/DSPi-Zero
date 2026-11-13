@@ -1,6 +1,6 @@
 // smi_frames_a32 (smi_frame.h): matches smi_frames_c bit for bit, as tests/smi_frame_test.c checks under
-// QEMU. Scheduled for the in-order Cortex-A53, with the NRZI running XOR in core registers, four words
-// side by side. A written frame costs its 512 bytes' trip to the uncached ring, about 275 cycles, which
+// QEMU. Scheduled for the in-order Cortex-A53, with the S/PDIF running XOR in core registers, left and
+// right words side by side. A written frame costs its 512 bytes' trip to the uncached ring, about 275 cycles, which
 // hides the work; a frame the ring already holds costs the compare, about 45 (bring-up section 27).
 
     .syntax unified
@@ -19,40 +19,40 @@
     // Stack while composing: the four raw pointers, then the frames written.
     .equ SP_WROTE, 16
 
-// Slot s's 128 levels into q (dlo, dhi), from its 4 raw words. Uses r4-r7, r12, lr and q8.
+// Slot s's 128 levels into q (dlo, dhi), from its raw words. Uses r4-r7, r12, lr and q8.
 .macro LEVELS s, q, dlo, dhi
     ldr     lr, [r1, #JOB_TYPE + 4 * \s]
     ldr     r12, [sp, #4 * \s]
     cmp     lr, #1
     blo     3f
     bhi     2f
-    // S/PDIF: a running XOR over each word, then over the words.
-    ldm     r12, {r4-r7}
-    eor     r4, r4, r4, lsl #1
+    // S/PDIF: a running XOR over the left and right words gives each slot's second half, less the
+    // parity slot. A first half is the level before it inverted, with the preamble in the low 4 slots.
+    // The carry is the left word's bit 31, the start of a block, whose preamble is Z.
+    ldm     r12, {r4-r5}
+    eors    r4, r4, r4, lsl #1
     eor     r5, r5, r5, lsl #1
-    eor     r6, r6, r6, lsl #1
-    eor     r7, r7, r7, lsl #1
     eor     r4, r4, r4, lsl #2
     eor     r5, r5, r5, lsl #2
-    eor     r6, r6, r6, lsl #2
-    eor     r7, r7, r7, lsl #2
     eor     r4, r4, r4, lsl #4
     eor     r5, r5, r5, lsl #4
-    eor     r6, r6, r6, lsl #4
-    eor     r7, r7, r7, lsl #4
     eor     r4, r4, r4, lsl #8
     eor     r5, r5, r5, lsl #8
-    eor     r6, r6, r6, lsl #8
-    eor     r7, r7, r7, lsl #8
     eor     r4, r4, r4, lsl #16
     eor     r5, r5, r5, lsl #16
-    eor     r6, r6, r6, lsl #16
-    eor     r7, r7, r7, lsl #16
-    eor     r5, r5, r4, asr #31
-    eor     r6, r6, r5, asr #31
-    eor     r7, r7, r6, asr #31
-    vmov    \dlo, r4, r5
-    vmov    \dhi, r6, r7
+    mvn     r6, r4, lsl #1
+    mvn     r7, r5, lsl #1
+    bic     r4, r4, #0x80000000
+    bic     r5, r5, #0x80000000
+    eor     r6, r6, #6
+    eor     r7, r7, #6
+    eorcs   r6, r6, #12
+    vmov    \dhi, r4, r5
+    vmov    \dlo, r6, r7
+    vmull.p8 q8, \dhi, \dhi
+    vmull.p8 \q, \dlo, \dlo
+    vshl.i16 q8, q8, #1
+    vorr    \q, \q, q8
     b       4f
     // I2S: the last R's LSB, L and R's top 31 bits, MSB first, each bit clock two cell times.
 2:  ldmib   r12, {r4-r6}

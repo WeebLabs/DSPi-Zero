@@ -775,8 +775,9 @@ static void shim_output_clock_set_rate(uint32_t freq) {
 // consumes what the output clock counts from the moment it was enabled. last_read_time_us holds the
 // output clock at the last read.
 
-// The ring contents match the RP2350 libraries': S/PDIF frames as NRZI-coded cells, I2S frames as
-// left-justified 32-bit L and R words. consumed_words is frames times the real words per frame.
+// I2S ring frames are as the RP2350 library's, left-justified 32-bit L and R words. S/PDIF ring frames
+// are two words that the composer encodes. consumed_words counts the RP2350's words a frame, 4 for
+// S/PDIF, which is what DSPi's clock diagnostics expect.
 #define SHIM_RING_FUNCS(P, T, RING_FRAMES_, ERASE_AHEAD_, WORDS_PER_FRAME_)                              \
     static void P##_shim_stamp_silence(T *inst, uint32_t e, uint32_t n) {                                 \
         P##_stamp_silence_run((uint32_t *)inst->ring, e, n);                                              \
@@ -903,28 +904,13 @@ static void shim_output_clock_set_rate(uint32_t freq) {
         inst->snap_consumed_frames = consumed;                                                            \
     }
 
-// S/PDIF encoding, as pico_audio_spdif_multi's software encoder (pico-extras audio_spdif.c and
-// sample_encoding.h, BSD-3-Clause, Raspberry Pi Ltd): each subframe is 64 NRZI cells, LSB first, where a
-// 1 toggles the line. The channel-status bit comes from the absolute frame index modulo 192.
-#define PREAMBLE_X 0b11001001u
-#define PREAMBLE_Y 0b01101001u
-#define PREAMBLE_Z 0b00111001u
+// S/PDIF rings hold two words a frame, a sample and its status bit each (smi_frame.h), and the composer
+// encodes them. What reaches the pin is what pico_audio_spdif_multi's software encoder sends, with the
+// channel-status bit taken from the absolute frame index modulo 192 when the frame is written.
+#include "smi_frame.h"
 
-static uint32_t spdif_lookup[256];
 static uint8_t spdif_channel_status[5] = {0x04, 0x00, 0x00, 0x02, 0x0B};   // byte 3: sample rate
-
-static void spdif_lookup_init(void) {
-    for (uint32_t i = 0; i < 256u; i++) {
-        uint32_t v = 0x5555u, p = 0;
-        for (uint32_t j = 0; j < 8u; j++) {
-            if (i & (1u << j)) {
-                p ^= 1u;
-                v |= 2u << (j * 2u);
-            }
-        }
-        spdif_lookup[i] = v | (p << 16u);
-    }
-}
+static uint32_t spdif_idle[SMI_SPDIF_BLOCK][2];     // the silent frame at each block phase
 
 static void spdif_set_status_rate(uint32_t freq) {  // channel status byte 3
     switch (freq) {
@@ -933,78 +919,49 @@ static void spdif_set_status_rate(uint32_t freq) {  // channel status byte 3
         case 96000: spdif_channel_status[3] = 0x0A; break;
         default: spdif_channel_status[3] = 0x01; break;
     }
-}
-
-static inline uint32_t spdif_cs_bit(uint32_t phase) {
-    return phase < 40u ? (spdif_channel_status[phase / 8u] >> (phase % 8u)) & 1u : 0u;
-}
-
-static inline void spdif_update_subframe(uint32_t *sf, int32_t sample) {
-    uint32_t s0 = spdif_lookup[(uint8_t)sample];
-    uint32_t s1 = spdif_lookup[(uint8_t)(sample >> 8u)];
-    uint32_t s2 = spdif_lookup[(uint8_t)(sample >> 16u)];
-    sf[0] = (sf[0] & 0xFFu) | ((uint32_t)(uint16_t)s0 << 8u) | (s1 << 24u);
-    uint32_t ph = sf[1] >> 24u;
-    uint32_t h = ((uint32_t)(uint16_t)s1 >> 8u) | ((uint32_t)(uint16_t)s2 << 8u);
-    uint32_t p = (s0 >> 16u) ^ (s1 >> 16u) ^ (s2 >> 16u);
-    p ^= (((ph & 0x2Au) * 0x2Au) >> 6u) & 1u;
-    sf[1] = h | ((ph & 0x7Fu) << 24u) | (p << 31u);
+    smi_spdif_silence_init(spdif_idle, spdif_channel_status);
 }
 
 static void audio_spdif_stamp_audio_run(uint32_t *ring, uint32_t w, const int32_t *lr, uint32_t n) {
-    uint32_t phase = w % PICO_AUDIO_SPDIF_BLOCK_SAMPLE_COUNT;
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t *f = &ring[((w + i) & (PICO_AUDIO_SPDIF_RING_FRAMES - 1u)) * 4u];
-        uint32_t c = spdif_cs_bit(phase);
-        f[0] = phase == 0 ? PREAMBLE_Z : PREAMBLE_X;
-        f[1] = 0x55000000u | (c << 29u);
-        spdif_update_subframe(&f[0], lr[2u * i]);
-        f[2] = PREAMBLE_Y;
-        f[3] = 0x55000000u | (c << 29u);
-        spdif_update_subframe(&f[2], lr[2u * i + 1u]);
-        if (++phase == PICO_AUDIO_SPDIF_BLOCK_SAMPLE_COUNT) {
-            phase = 0;
-        }
-    }
+    smi_spdif_write(ring, PICO_AUDIO_SPDIF_RING_FRAMES, spdif_idle, w, lr, n);
 }
 
 static void audio_spdif_stamp_silence_run(uint32_t *ring, uint32_t e, uint32_t n) {
-    uint32_t phase = e % PICO_AUDIO_SPDIF_BLOCK_SAMPLE_COUNT;
-    while (n--) {
-        uint32_t *f = &ring[(e++ & (PICO_AUDIO_SPDIF_RING_FRAMES - 1u)) * 4u];
-        uint32_t c = spdif_cs_bit(phase);
-        uint32_t h = 0x55555555u | (c << 29u) | (c << 31u);
-        f[0] = 0x55555500u | (phase == 0 ? PREAMBLE_Z : PREAMBLE_X);
-        f[1] = h;
-        f[2] = 0x55555500u | PREAMBLE_Y;
-        f[3] = h;
-        if (++phase == PICO_AUDIO_SPDIF_BLOCK_SAMPLE_COUNT) {
-            phase = 0;
-        }
-    }
+    smi_spdif_write(ring, PICO_AUDIO_SPDIF_RING_FRAMES, spdif_idle, e, NULL, n);
 }
 
 // I2S words as pico_audio_i2s_multi stores them: the 24-bit sample left-justified, with 0x01 in the pad
 // byte so a DAC's zero-detect mute never latches.
 #define I2S_PAD_PATTERN 0x01u
 
-static void audio_i2s_stamp_audio_run(uint32_t *ring, uint32_t w, const int32_t *lr, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t *f = &ring[((w + i) & (PICO_AUDIO_I2S_RING_FRAMES - 1u)) * 2u];
-        f[0] = (uint32_t)lr[2u * i] << 8 | I2S_PAD_PATTERN;
-        f[1] = (uint32_t)lr[2u * i + 1u] << 8 | I2S_PAD_PATTERN;
+// Ring frames w to w + n - 1 from n stereo samples, or as silence when lr is NULL, 4 words at a time.
+static void audio_i2s_stamp(uint32_t *ring, uint32_t w, const int32_t *lr, uint32_t n) {
+    const uint32x4_t pad = vdupq_n_u32(I2S_PAD_PATTERN);
+    while (n) {
+        uint32_t at = w & (PICO_AUDIO_I2S_RING_FRAMES - 1u);
+        uint32_t run = MIN(n, PICO_AUDIO_I2S_RING_FRAMES - at), words = 2u * run, i = 0;
+        uint32_t *f = &ring[at * 2u];
+        for (; i + 4u <= words; i += 4u) {
+            vst1q_u32(&f[i], lr ? vorrq_u32(vshlq_n_u32(vreinterpretq_u32_s32(vld1q_s32(&lr[i])), 8), pad) : pad);
+        }
+        for (; i < words; i++) {
+            f[i] = lr ? (uint32_t)lr[i] << 8 | I2S_PAD_PATTERN : I2S_PAD_PATTERN;
+        }
+        lr = lr ? lr + words : NULL;
+        w += run;
+        n -= run;
     }
+}
+
+static void audio_i2s_stamp_audio_run(uint32_t *ring, uint32_t w, const int32_t *lr, uint32_t n) {
+    audio_i2s_stamp(ring, w, lr, n);
 }
 
 static void audio_i2s_stamp_silence_run(uint32_t *ring, uint32_t e, uint32_t n) {
-    while (n--) {
-        uint32_t *f = &ring[(e++ & (PICO_AUDIO_I2S_RING_FRAMES - 1u)) * 2u];
-        f[0] = I2S_PAD_PATTERN;
-        f[1] = I2S_PAD_PATTERN;
-    }
+    audio_i2s_stamp(ring, e, NULL, n);
 }
 
-// S/PDIF frames are two subframes of two words; I2S frames are two words.
+// The last argument is the words a frame that consumed_words counts, 4 in the RP2350's S/PDIF frame.
 SHIM_RING_FUNCS(audio_spdif, audio_spdif_instance_t, PICO_AUDIO_SPDIF_RING_FRAMES, PICO_AUDIO_SPDIF_ERASE_AHEAD, 4u)
 SHIM_RING_FUNCS(audio_i2s, audio_i2s_instance_t, PICO_AUDIO_I2S_RING_FRAMES, PICO_AUDIO_I2S_ERASE_AHEAD, 2u)
 
@@ -1330,8 +1287,6 @@ void audio_i2s_mck_apply_state(uint pin, bool enabled, uint32_t sample_freq, uin
 // the same SMI cycle. Slot n's data is SD n (GPIO 8 + n); the I2S bit clock is SD4 (GPIO 12) and LRCLK
 // SD5 (GPIO 13). An S/PDIF cell lasts 2 words and an I2S bit clock 4, at every sample rate.
 
-#include "smi_frame.h"
-
 #define SMI_SLOTS 4u
 #define SMI_BIT_ADAT 8u   // SD8, GPIO 16, claimed only while ADAT is enabled
 #define SMI_PIN_MASK (0x3Fu << 8)
@@ -1429,7 +1384,7 @@ static uint32_t smi_compose(uint32_t frame, uint16_t *dst, uint32_t ring_idx, ui
         ring[slot] = found[s].ring;
         offset[slot] = found[s].offset;
         job.type[slot] = found[s].i2s ? SMI_SLOT_I2S : SMI_SLOT_SPDIF;
-        job.stride[slot] = found[s].i2s ? 8u : 16u;
+        job.stride[slot] = found[s].i2s ? 8u : SMI_SPDIF_STRIDE;
         cfg |= job.type[slot] << (2u * slot);
     }
     if (cfg != last_cfg || ring_idx != next_idx) {
@@ -1445,9 +1400,19 @@ static uint32_t smi_compose(uint32_t frame, uint16_t *dst, uint32_t ring_idx, ui
         uint32_t run = n;
         for (uint32_t s = 0; s < SMI_SLOTS; s++) {
             if (job.type[s] == SMI_SLOT_SPDIF) {
+                // The frame and, for the key, the one after, which wraps at the ring's end.
                 uint32_t rf = (frame + offset[s]) & (PICO_AUDIO_SPDIF_RING_FRAMES - 1u);
-                job.raw[s] = &ring[s][rf * 4u];
-                run = MIN(run, PICO_AUDIO_SPDIF_RING_FRAMES - rf);
+                job.raw[s] = &ring[s][rf * 2u];
+                if (rf == PICO_AUDIO_SPDIF_RING_FRAMES - 1u) {
+                    wrap[s][0] = ring[s][rf * 2u];
+                    wrap[s][1] = ring[s][rf * 2u + 1u];
+                    wrap[s][2] = ring[s][0];
+                    wrap[s][3] = ring[s][1];
+                    job.raw[s] = wrap[s];
+                    run = 1;
+                } else {
+                    run = MIN(run, PICO_AUDIO_SPDIF_RING_FRAMES - 1u - rf);
+                }
             } else if (job.type[s] == SMI_SLOT_I2S) {
                 // The frame before and this one, which wrap at the ring's start.
                 uint32_t at = ((frame + offset[s]) * 2u - 2u) & (PICO_AUDIO_I2S_RING_FRAMES * 2u - 1u);
@@ -1484,7 +1449,7 @@ static uint32_t smi_compose(uint32_t frame, uint16_t *dst, uint32_t ring_idx, ui
 
 // Starts the SMI stream (before DSPi creates its slots), and from then on the output clock is its frame count.
 void shim_smi_start(void) {
-    spdif_lookup_init();
+    smi_spdif_silence_init(spdif_idle, spdif_channel_status);
     smi_tables_init();
     if (smi_out_start(smi_ring, SMI_RING_FRAMES, oc_freq, SMI_PIN_MASK, smi_compose)) {
         oc_smi = true;

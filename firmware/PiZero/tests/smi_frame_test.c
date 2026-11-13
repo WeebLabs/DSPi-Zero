@@ -3,6 +3,10 @@
 // without the I2S clocks and ADAT, must give the same 256 words, and the key must skip only a repeat.
 // For the Mac it builds without the assembly: cc -O2 -I.. smi_frame_test.c
 
+// S/PDIF slots are checked against the cell format their rings held before (bring-up section 28). The
+// same samples go through the old encoder, kept here, whose NRZI cells the reference turns into words,
+// and through smi_spdif_write, whose ring words the composer encodes. Both must give the same words.
+
 // Build for QEMU, to any scratch path:
 //   arm-none-eabi-gcc -mcpu=cortex-a53 -mfpu=neon-fp-armv8 -mfloat-abi=hard -marm -O2 -I..
 //     --specs=rdimon.specs -Wl,-e,qemu_start -Wl,-Ttext-segment=0x40010000 -o smif.elf smi_frame_test.c
@@ -57,7 +61,71 @@ static uint32_t nrzi_levels(uint32_t x, uint32_t *carry) {
     return x;
 }
 
-// in[s] is the slot's raw frame: S/PDIF words 0-3, or I2S's last L and R, then L and R.
+// The encoder the S/PDIF rings were written with before, as pico_audio_spdif_multi's (pico-extras
+// audio_spdif.c and sample_encoding.h, BSD-3-Clause, Raspberry Pi Ltd): 4 words of NRZI cells a frame.
+#define PREAMBLE_X 0b11001001u
+#define PREAMBLE_Y 0b01101001u
+#define PREAMBLE_Z 0b00111001u
+
+static uint32_t spdif_lookup[256];
+
+static void spdif_lookup_init(void) {
+    for (uint32_t i = 0; i < 256u; i++) {
+        uint32_t v = 0x5555u, p = 0;
+        for (uint32_t j = 0; j < 8u; j++) {
+            if (i & (1u << j)) {
+                p ^= 1u;
+                v |= 2u << (j * 2u);
+            }
+        }
+        spdif_lookup[i] = v | (p << 16u);
+    }
+}
+
+static uint32_t spdif_cs_bit(const uint8_t status[5], uint32_t phase) {
+    return phase < 40u ? (status[phase / 8u] >> (phase % 8u)) & 1u : 0u;
+}
+
+static void spdif_update_subframe(uint32_t *sf, int32_t sample) {
+    uint32_t s0 = spdif_lookup[(uint8_t)sample];
+    uint32_t s1 = spdif_lookup[(uint8_t)(sample >> 8u)];
+    uint32_t s2 = spdif_lookup[(uint8_t)(sample >> 16u)];
+    sf[0] = (sf[0] & 0xFFu) | ((uint32_t)(uint16_t)s0 << 8u) | (s1 << 24u);
+    uint32_t ph = sf[1] >> 24u;
+    uint32_t h = ((uint32_t)(uint16_t)s1 >> 8u) | ((uint32_t)(uint16_t)s2 << 8u);
+    uint32_t p = (s0 >> 16u) ^ (s1 >> 16u) ^ (s2 >> 16u);
+    p ^= (((ph & 0x2Au) * 0x2Au) >> 6u) & 1u;
+    sf[1] = h | ((ph & 0x7Fu) << 24u) | (p << 31u);
+}
+
+// Ring frames w to w + n - 1 as cells, from samples or (lr NULL) as the old silence stamp wrote them.
+static void old_spdif_write(uint32_t *ring, uint32_t ring_frames, const uint8_t status[5], uint32_t w,
+                            const int32_t *lr, uint32_t n) {
+    uint32_t phase = w % 192u;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t *f = &ring[((w + i) & (ring_frames - 1u)) * 4u];
+        uint32_t c = spdif_cs_bit(status, phase);
+        if (lr) {
+            f[0] = phase == 0 ? PREAMBLE_Z : PREAMBLE_X;
+            f[1] = 0x55000000u | (c << 29u);
+            spdif_update_subframe(&f[0], lr[2u * i]);
+            f[2] = PREAMBLE_Y;
+            f[3] = 0x55000000u | (c << 29u);
+            spdif_update_subframe(&f[2], lr[2u * i + 1u]);
+        } else {
+            uint32_t h = 0x55555555u | (c << 29u) | (c << 31u);
+            f[0] = 0x55555500u | (phase == 0 ? PREAMBLE_Z : PREAMBLE_X);
+            f[1] = h;
+            f[2] = 0x55555500u | PREAMBLE_Y;
+            f[3] = h;
+        }
+        if (++phase == 192u) {
+            phase = 0;
+        }
+    }
+}
+
+// in[s] is the slot's raw frame: S/PDIF's 4 words of cells, or I2S's last L and R, then L and R.
 static void reference(uint16_t *dst, uint32_t in[4][4], const uint32_t type[4], bool clocks, const uint32_t *adat) {
     uint8_t low[4][256];
     memset(low, 0, sizeof low);
@@ -157,20 +225,91 @@ static uint32_t check(frames_fn fn, const char *name, const smi_frame_job_t *job
     return bad != 0;
 }
 
+static uint32_t shaped(uint32_t shape) {  // random, all zeros, all ones, sparse
+    return shape == 0 ? rnd() : shape == 1 ? 0u : shape == 2 ? 0xFFFFFFFFu : 1u << (rnd() % 32u);
+}
+
+static void random_status(uint8_t status[5]) {
+    static const uint8_t rates[4] = {0x00, 0x02, 0x0A, 0x01};
+    memcpy(status, (const uint8_t[5]){0x04, 0x00, 0x00, rates[rnd() % 4u], 0x0B}, 5);
+    for (uint32_t j = 0; j < 5u && rnd() % 4u == 0; j++) {
+        status[j] = (uint8_t)rnd();
+    }
+}
+
+#define BLOCK_RING 512u
+
+// Whole channel-status blocks. A 512-frame ring is written in runs of audio and silence that wrap it,
+// by the old encoder and by smi_spdif_write, then every ring frame is composed and compared.
+static uint32_t block_check(frames_fn fn, const char *name, const uint8_t status[5]) {
+    static const uint32_t zeros[4];
+    static uint32_t cells[BLOCK_RING * 4u], words[BLOCK_RING * 2u + 2u], idle[SMI_SPDIF_BLOCK][2];
+    static uint32_t key[BLOCK_RING * SMI_FRAME_KEY_WORDS] __attribute__((aligned(32)));
+    static uint16_t got[BLOCK_RING * 256u] __attribute__((aligned(64))), want[256];
+    int32_t lr[2u * 64u];
+    uint32_t w = rnd(), bad = 0, slot = rnd() % 4u, done = 0;
+    smi_spdif_silence_init(idle, status);
+    while (done < BLOCK_RING) {
+        uint32_t n = 1u + rnd() % 64u, shape = rnd() % 4u;
+        bool silence = rnd() % 3u == 0;
+        n = n < BLOCK_RING - done ? n : BLOCK_RING - done;
+        for (uint32_t j = 0; j < 2u * n; j++) {
+            lr[j] = (int32_t)shaped(shape);
+        }
+        old_spdif_write(cells, BLOCK_RING, status, w, silence ? NULL : lr, n);
+        smi_spdif_write(words, BLOCK_RING, idle, w, silence ? NULL : lr, n);
+        w += n;
+        done += n;
+    }
+    smi_frame_job_t job = {.raw = {zeros, zeros, zeros, zeros}, .msb8 = lut_msb8, .stale = 1};
+    uint32_t type[4] = {0};
+    job.raw[slot] = words;
+    job.type[slot] = type[slot] = SMI_SLOT_SPDIF;
+    job.stride[slot] = SMI_SPDIF_STRIDE;
+    bad |= fn(got, &job, key, BLOCK_RING) != BLOCK_RING;
+    for (uint32_t k = 0; k < BLOCK_RING; k++) {
+        uint32_t in[4][4] = {{0}};
+        memcpy(in[slot], &cells[4u * k], 16);
+        reference(want, in, type, false, NULL);
+        bad |= memcmp(&got[k * 256u], want, 512) != 0;
+    }
+    if (bad) {
+        printf("%s: block of status %02x %02x %02x %02x %02x differs\n", name, status[0], status[1], status[2],
+               status[3], status[4]);
+    }
+    return bad != 0;
+}
+
 int main(void) {
     static const uint32_t zeros[4];
     tables_init();
+    spdif_lookup_init();
     uint32_t fails = 0, runs = 0;
     for (uint32_t t = 0; t < 81u * 4u * 100u; t++) {
         smi_frame_job_t job = {.clocks = (t / 81u) & 1u, .msb8 = lut_msb8};
-        uint32_t buf[4][RUN * 4u], adat[RUN * 8u];
-        uint32_t c = t % 81u, shape = rnd() % 4u, n = 1u + rnd() % RUN;   // random, all zeros, all ones, sparse
+        // Each slot's ring words, with room for the 4 the key reads at the last frame. cells holds the
+        // same S/PDIF frames as the old encoder wrote them.
+        uint32_t buf[4][RUN * 4u], cells[4][8u * 4u], adat[RUN * 8u];
+        uint32_t c = t % 81u, shape = rnd() % 4u, n = 1u + rnd() % RUN;
         for (uint32_t s = 0; s < 4u; s++, c /= 3u) {
             job.type[s] = c % 3u;
             job.raw[s] = job.type[s] == SMI_SLOT_OFF ? zeros : buf[s];
-            job.stride[s] = job.type[s] == SMI_SLOT_SPDIF ? 16u : job.type[s] == SMI_SLOT_I2S ? 8u : 0u;
+            job.stride[s] = job.type[s] == SMI_SLOT_SPDIF ? SMI_SPDIF_STRIDE : job.type[s] == SMI_SLOT_I2S ? 8u : 0u;
             for (uint32_t j = 0; j < RUN * 4u; j++) {
-                buf[s][j] = shape == 0 ? rnd() : shape == 1 ? 0u : shape == 2 ? 0xFFFFFFFFu : 1u << (rnd() % 32u);
+                buf[s][j] = shaped(shape);
+            }
+            if (job.type[s] == SMI_SLOT_SPDIF) {
+                uint32_t idle[SMI_SPDIF_BLOCK][2], w = rnd() & ~7u;     // any block phase, ring frame 0
+                uint8_t status[5];
+                int32_t lr[2u * RUN];
+                bool silence = rnd() % 4u == 0;
+                random_status(status);
+                smi_spdif_silence_init(idle, status);
+                for (uint32_t j = 0; j < 2u * RUN; j++) {
+                    lr[j] = (int32_t)shaped(shape);
+                }
+                old_spdif_write(cells[s], 8u, status, w, silence ? NULL : lr, RUN);
+                smi_spdif_write(buf[s], 8u, idle, w, silence ? NULL : lr, RUN);
             }
         }
         for (uint32_t j = 0; j < RUN * 8u; j++) {
@@ -182,14 +321,38 @@ int main(void) {
             uint32_t in[4][4];
             for (uint32_t s = 0; s < 4u; s++) {
                 memcpy(in[s], (const uint8_t *)job.raw[s] + k * job.stride[s], 16);
+                if (job.type[s] == SMI_SLOT_SPDIF) {
+                    memcpy(in[s], &cells[s][4u * k], 16);
+                }
             }
             reference(&want[k * 256u], in, job.type, job.clocks, job.adat ? &adat[8u * k] : NULL);
         }
         fails += check(smi_frames_c, "smi_frames_c", &job, n, want);
 #ifdef __arm__
         fails += check(smi_frames_a32, "smi_frames_a32", &job, n, want);
+        // Ring words the writer never makes must still compose as the C does.
+        for (uint32_t s = 0; s < 4u; s++) {
+            for (uint32_t j = 0; j < RUN * 4u; j++) {
+                buf[s][j] = shaped(rnd() % 4u);
+            }
+        }
+        uint32_t key[RUN * SMI_FRAME_KEY_WORDS], akey[RUN * SMI_FRAME_ADAT_WORDS];
+        smi_frame_job_t any = job;
+        any.adat_key = akey;
+        any.stale = 1;
+        smi_frames_c(want, &any, key, n);
+        fails += check(smi_frames_a32, "smi_frames_a32 on any words", &job, n, want);
 #endif
         runs += n;
+    }
+    for (uint32_t t = 0; t < 200u; t++) {
+        uint8_t status[5];
+        random_status(status);
+        fails += block_check(smi_frames_c, "smi_frames_c", status);
+#ifdef __arm__
+        fails += block_check(smi_frames_a32, "smi_frames_a32", status);
+#endif
+        runs += BLOCK_RING;
     }
     printf("%s: %u frames, %u differ\n", fails ? "FAIL" : "PASS", (unsigned)runs, (unsigned)fails);
     return fails != 0;
