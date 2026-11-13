@@ -595,12 +595,15 @@ These came from a temporary test request that streamed a pattern ring with the t
 - **One stream.** `smi_out.c` streams 16-bit words at 256 fs: 12.288 MHz at 48 kHz, 11.2896 MHz at 44.1 kHz and 24.576 MHz at 96 kHz. A 1 + 1 + 1 cycle runs from 500 MHz PLLD through the fractional divider. The 1/256 divider step leaves the rate up to about 70 ppm off nominal (48,003 Hz at 48 kHz), which the USB feedback absorbs.
   *Update (2026-11-12): the SMI clock now comes from PLLA with an integer divider and no fractional dither, exact at every rate, with this PLLD path kept as the fallback. See `PiZero_PLLA_plan.md`.*
 - **Ring and interrupts.** A DMA loop runs over a 128-frame ring of 256-word frames, with an interrupt every 16 frames. The interrupt refreshes `L` and calls the composer, which keeps the ring 64 frames ahead of the DMA. The ring is cached, and each composed block is cleaned out to SDRAM for the DMA.
+  *Update (2026-11-12): the ring is now 192 frames of uncached memory and nothing is cleaned. See section 27.*
 - **Composer.** `pico_shim.c` turns each slot ring into its pin's bits. An S/PDIF cell lasts 2 words and an I2S bit clock 4, at every rate. Slot n is always bit n, so the four slots merge with NEON shift-and-insert, 16 words at a time, and the clocks are ORed in.
+  *Update (2026-11-12): the composer is now `smi_frame_a32.S`, which uses no tables for the slots and leaves a frame the ring already holds. See section 27.*
 - **Ring contents as on the RP2350.** The S/PDIF ring writes now encode exactly as `pico_audio_spdif_multi`'s software encoder: its lookup table, preambles, channel status (with the sample-rate byte) and parity. Each ring holds NRZI cells, where a 1 toggles the line, and the composer turns them into levels with a running XOR. I2S words are stored as `pico_audio_i2s_multi` stores them: `(sample << 8) | 0x01`. The earlier stand-in stored raw values, so section 18's PCM output was 48 dB too quiet.
 - **Philips I2S timing.** 64 BCK per frame, LRCLK low for left, data changing on BCK falling and one bit clock behind LRCLK.
 - **Output clock.** `shim_output_clock()` is the composer's frame count. The composer is what reads the slot rings, so DSPi's fill, underrun and recovery accounting measure the real reader. Its lead adds about 1.3 ms of latency at 48 kHz.
 - **Fill servo.** On the RP2350, DSPi's own feedback steers the slot fill. Here the consumer does it: each 1 ms tick it moves up to 2 frames more or fewer than the composer took, so slot 0's mid-block fill sits at DSPi's target.
 - **Uncached memory.** Only DMA control blocks remain uncached. Uncached slot and SMI rings had made the composer cost 3,512 cycles a frame.
+  *Update (2026-11-12): the SMI ring is uncached again, and the slot rings stay cached. Written only with 32-byte NEON stores and never read by the composer, it costs less than the cached ring and its clean. See section 27.*
 
 ### USB feedback: macOS reads it per service interval
 
@@ -625,6 +628,7 @@ macOS reads the value in samples per data-endpoint service interval: 1 ms here, 
 - **Stability.** With `--watch`, 30 s at each rate and 120 s at 48 kHz showed no slot underruns, ring drops, USB underruns or late compositions. The slot fill held near DSPi's target and the FIFO near half full.
 - **Restarts.** The UAC2 stream check passed three stop/start cycles.
 - **CPU at 48 kHz with four S/PDIF slots.** DSPi's block, including the S/PDIF encoding, takes 34.7 µs per 48 frames, about 3.5%. Interrupts (the composer and USB) take 8%. The composer alone is 930 cycles a frame plus 390 for the cache clean, about 6% at 48 kHz and 12% at 96 kHz. `z4_perf.py` now subtracts every interrupt, not only USB's.
+  *Update (2026-11-12): the composer is now 350 cycles a frame while audio plays and 72 while the outputs are silent. See section 27.*
 
 ### Not done yet
 
@@ -709,6 +713,7 @@ DSPi's ADAT output now runs, on GPIO 16 (SMI SD8, header pin 36). As with the ot
 - **Stream health:** over 60 s each at 48 and 44.1 kHz, there were no underruns, ring drops, late compositions, ADAT resyncs or slips. `usb_health.py` shows no hang recoveries.
 
 **Cost.** The composer takes 1185 cycles a frame with ADAT running, against 900 without it (885 before this change). The extra is about 1.4% of the 1 GHz CPU at 48 kHz.
+*Update (2026-11-12): with the composer of section 27 it is 436 cycles a frame with ADAT running and every frame written, against 350 without it.*
 
 **Not covered.** No ADAT receiver has decoded the pin. ADAT's 96 kHz mode (S/MUX) is not offered, because DSPi does not offer it on the RP2350 either.
 
@@ -784,6 +789,8 @@ DSPi's own CPU figure (`global_status.cpu0_load`) is the time `process_input_blo
 
 The S/PDIF row was taken before the decoder was made cheaper (section 23). It now reads 19.4%, with interrupts at 14.1%.
 
+*Update (2026-11-12): with the composer of section 27 the first three rows read 1.2%, 8.3% and 14.1%. The S/PDIF input row has not been taken again.*
+
 `REQ_GET_STATUS` wValue 9, which DSPi Console reads, returned the same figure as the meter, rounded.
 
 **Polling left out.** The main loop runs about 270,000 passes a second, and the calls that find nothing to do take 50 to 65% of the core. That is waiting, which a sleeping loop would not spend, so it is not counted.
@@ -816,4 +823,64 @@ The S/PDIF row was taken before the decoder was made cheaper (section 23). It no
 - The loader's own reboot request brought DSPi back from the card in 6.1 s, 4 s of which is startup.S's LED flicker.
 
 An image sent over USB runs until the power is removed. Keeping it means copying it onto the card as `kernel.img`, because the loader cannot write the card.
+
+## 27. A cheaper output path
+
+*Added: 2026-11-12*
+
+The SMI composer was the largest single load on the core: 48,000 frames a second at 930 cycles composing and 390 cleaning each, whether or not anything was playing, because the stream never stops. It now costs 72 cycles a frame while the outputs are silent and 350 while audio plays. The pins carry the same bits as before, and the composed-frame count, the lead and the interrupt rate are unchanged.
+
+**What changed.**
+- **The ring is not cached.** `smi_ring` is in `.nocache`, which `mmu_enable()` maps as Normal non-cacheable memory. The composer only writes it, with 32-byte NEON stores, and the DMA reads what was written, so `smi_out.c` no longer cleans anything. It ends each interrupt's composing with one `dsb`.
+- **No tables for the slots.** `smi_frame.h` describes the frame. Each slot becomes 128 line levels, one per S/PDIF cell time (2 SMI words). An S/PDIF slot's levels are the running XOR of its NRZI cells. An I2S slot's are its 64 bits, each doubled by squaring as a polynomial (`vmull.p8` of a byte with itself moves bit i to bit 2i). Two more rounds of squaring interleave the four slots into one nibble per cell, slot n in bit n. The clocks are ORed in, and each cell is stored as two words.
+- **Assembly.** `smi_frame_a32.S` is the version the Pi runs, and `smi_frames_c` in the header is the reference. `tests/smi_frame_test.c` checks the reference against the old table-driven composer, and the assembly against both under QEMU, over every mix of slot types with and without the clocks and ADAT.
+- **A frame the ring already holds is left.** The ring is 192 frames, one S/PDIF channel-status block. Silence repeats with that period, and DSPi stamps silence with the block phase of the absolute frame number, so a silent stream finds every ring frame already holding the frame it is due. To know that, the composer keeps a key for each ring frame: the 16 slot ring words the frame was made from (and the 8 ADAT words while ADAT runs). A frame whose words equal its key is not written. The comparison is of the inputs themselves, not of a hash, and nothing is assumed about what is playing: a 1 kHz tone at 48 kHz repeats every 48 frames and is left in the same way.
+- **Runs.** The first frame of a run that differs is written, and so is the rest of that run (at most 16 frames) without comparing. Audio and silence both come in long stretches, so this spares the comparison while audio plays. A key is stored only when its frame is written.
+- **When the keys are not trusted.** After a change of slot types, of the I2S clocks or of ADAT, and after any gap in what was composed (the late path), every frame is written for one lap of the ring.
+- **Ring index.** The ring length is no longer a power of two, so `smi_out.c` keeps the composer's ring index in its own counter. The frame count wraps at 2^32, which is not a multiple of 192.
+
+**What it costs now** (`smi_check.py`, slots I2S, S/PDIF, I2S, S/PDIF, cycles a frame on the 1 GHz core). `smi_check.py` now plays 997 Hz, which never repeats within the ring, and `--silent` plays nothing.
+
+| Step | Playing | Silent |
+|---|---|---|
+| Before: 16 words at a time from tables, cached ring, cleaned | 924 + 390 | 924 + 390 |
+| The ring uncached, nothing cleaned | 900 | 900 |
+| Levels and polynomial squaring in C (GCC kept its vectors on the stack) | 489 | 489 |
+| Keys and the 192-frame ring, one frame a call in assembly | 432 | 167 |
+| The frame loop in assembly, runs of frames a call | 364 | 89 |
+| The rest of a run written without comparing, keys stored only when written, I2S words read aligned | 350 | 72 |
+
+All S/PDIF reads 355 playing and 91 silent, all I2S 353 and 81. At 44.1 and 96 kHz the cycles a frame are the same.
+
+**Whole core** (`cpu_check.py`, the figure DSPi Console shows).
+
+| Case | Before | Now | Interrupts now |
+|---|---|---|---|
+| USB input, no stream | 6.3 to 7.5% | 1.1 to 1.3% | 0.8 to 0.9% |
+| USB tone at 48 kHz, 997 Hz | 13 to 14% | 8.3% | 3.5% |
+| USB tone at 48 kHz, 1 kHz (repeats in the ring) | | 7.1% | 2.3% |
+| USB tone at 96 kHz, 997 Hz | 21.2% | 14.1% | 5.8% |
+
+**Where the rest goes.**
+- **Playing.** The 512 bytes of a frame take about 275 cycles to reach the uncached ring, whatever the stores are: sixteen `vst4.8`, sixteen 32-byte `vst1` and thirty-two 16-byte `vst1` all measured the same, with nothing else in the loop. The composing hides under that. Taking the sixteen polynomial multiplies out, or the whole merge, changed the total by under 6 cycles. So the cost of a written frame is now the memory write, and only writing fewer bytes would lower it.
+- **Silent.** Of the 72 cycles, 25 are the per-interrupt work in C (reading DSPi's slot state, 400 cycles an interrupt) and 47 the comparison: six NEON loads, which take about 20 cycles when repeated on lines already in the cache, and a remainder that prefetching did not move and that has not been traced.
+
+**Tried, not kept.**
+- The cached ring with the new composer and a clean: 685 cycles a frame against 347.
+- Widening with `vmovl` and `vst2.16` instead of `vst4.8`: the same within 3 cycles. The shorter one stayed.
+- Software prefetch of the keys and slot rings, one frame and eight frames ahead: no change. Alignment hints on the loads: no change.
+- Comparing every frame while audio plays cost 11 cycles a frame more than writing the rest of a run blind.
+- A bench request that composed every frame a second time in the interrupt and compared it with the ring. Reading the uncached ring back a byte at a time took longer than the interrupt period, the board stopped answering and needed a power cycle. It was removed. Anything that reads the ring must do it outside the interrupt, as the snapshot does.
+
+**Checks on the board**, on the image described here.
+- `smi_check.py` at 44.1, 48 and 96 kHz with I2S/S/PDIF mixed, all S/PDIF and all I2S: every slot decoded, no late compositions. With `--silent` every slot decoded from frames the composer had left.
+- `adat_check.py`: channel 1 equalled slot 0's I2S word frame for frame at 48 kHz, the lag read 7.80 frames at 44.1 kHz, the pin was held low at 96 kHz, and 20 s at each rate showed no underruns, drops, resyncs or slips.
+- `mck_check.py` and `output_toggle_check.py` (400 toggles while a tone played) passed.
+- Tones started and stopped at 48 and 96 kHz in turn, with the load returning to 1.1% after the last.
+
+**Not covered.** The board stopped answering during the removed bench request, before these were run on the final image: `spdif_in_check.py --source`, `smi_check.py --watch 60`, and a test that changes slot types, the rate and ADAT while the outputs are silent and checks the stream after each. The frame count's wrap at 2^32 (24.9 hours at 48 kHz) has not been run through. No receiver or DAC has listened to the pins since the change.
+
+**Further, not done.**
+- With ADAT off, every cell is two equal words, so a 128-word frame at 6 SMI clocks a word would put the same levels on the pins from half the bytes: about 140 cycles a frame less while playing. ADAT needs one bit a word, so enabling it would have to change the SMI's word timing and frame length in the running stream, which has not been tried.
+- One DMA interrupt per 32 frames instead of 16 would halve the 400 cycles an interrupt and the interrupt entries, about 0.3% of the core. It was left because it coarsens the output clock's steps and lowers the composer's least lead from 48 frames to 32.
 

@@ -3,9 +3,12 @@
 GPIO 12, LRCLK on GPIO 13).
 
 Usage: python3.14 firmware/PiZero/tools/smi_check.py [--types i2s,spdif,i2s,spdif] [--rate HZ] [--keep]
+           [--hz HZ] [--silent]
 Sets each slot's output type with DSPi's REQ_SET_OUTPUT_TYPE, plays a quiet tone straight to the Pi (the
 Mac's default output is not changed), measures the SMI frame rate, then snapshots composed frames and
 decodes every slot from the pin bits. Slot types are put back afterwards unless --keep is given.
+The tone is 997 Hz so that no frame repeats and the composer's cost is that of composing every frame;
+--silent plays nothing and shows its cost when every frame is already in the ring.
 """
 import argparse
 import struct
@@ -18,7 +21,7 @@ REQ_SET_OUTPUT_TYPE, REQ_GET_OUTPUT_TYPE = 0xC0, 0xC1
 VENDOR_IFACE = 2
 BCK, LRCLK = 4, 5
 SMI_FIELDS = ("running", "dma_channel", "freq", "div_q8", "frames", "composed", "late", "irqs", "cs", "dma_debug",
-              "compose_cycles", "clean_cycles")
+              "compose_cycles", "reused")
 PREAMBLES = {"X": 0b11001001, "Y": 0b01101001, "Z": 0b00111001}
 
 
@@ -134,6 +137,10 @@ def main():
     ap.add_argument("--rate", type=int, default=48000)
     ap.add_argument("--keep", action="store_true", help="leave the slot types as tested")
     ap.add_argument("--watch", type=float, default=0, help="then watch fill and underruns for this many seconds")
+    ap.add_argument("--hz", type=int, default=997,
+                    help="tone frequency; 997 Hz never repeats within the 192-frame SMI ring, so every frame is composed")
+    ap.add_argument("--silent", action="store_true",
+                    help="play nothing (the rate stays as it is): the composer's cost when the outputs are silent")
     ap.add_argument("--observe", action="store_true",
                     help="change nothing: compare each slot's type in DSPi with what its pin carries")
     args = ap.parse_args()
@@ -151,9 +158,10 @@ def main():
     print("slot types:", ", ".join(("I2S" if get_type(dev, s) else "S/PDIF") for s in range(4)))
 
     failures = []
-    tone = Tone("DSPi Zero", rate=args.rate, set_device_rate=True)
+    tone = Tone("DSPi Zero", rate=args.rate, set_device_rate=True, hz=args.hz)
     try:
-        tone.start()
+        if not args.silent:
+            tone.start()
         time.sleep(2.0)
         a = smi_stats(dev)
         time.sleep(3.0)
@@ -166,9 +174,9 @@ def main():
               f"+{b['late'] - a['late']}, lead {b['composed'] - b['frames']} frames, CS {b['cs']:#x}")
         nf = max((b["composed"] - a["composed"]) & 0xFFFFFFFF, 1)
         cyc = ((b["compose_cycles"] - a["compose_cycles"]) & 0xFFFFFFFF) / nf
-        cln = ((b["clean_cycles"] - a["clean_cycles"]) & 0xFFFFFFFF) / nf
-        print(f"composer: {cyc:.0f} cycles a frame composing and {cln:.0f} cleaning, "
-              f"{(cyc + cln) * b['freq'] / 1e9 * 100:.2f}% of the 1 GHz CPU")
+        reused = ((b["reused"] - a["reused"]) & 0xFFFFFFFF) / nf
+        print(f"composer: {cyc:.0f} cycles a frame ({reused * 100:.1f}% of frames already in the ring and left), "
+              f"{cyc * b['freq'] / 1e9 * 100:.2f}% of the 1 GHz CPU")
         print(f"DSPi: slot 0 fill {s['slot0_fill']} (target {s['ring_target']}), USB underruns "
               f"{s['underruns']}, peaks out {s['peaks'][8:16]}")
         if abs(rate - b["freq"]) > b["freq"] * 0.002:
@@ -196,7 +204,8 @@ def main():
                 failures.append(f"underruns at {(q['uptime_ms'] - b['s']['uptime_ms']) / 1000:.0f} s")
             prev = c
     finally:
-        tone.stop()
+        if not args.silent:
+            tone.stop()
         if not args.keep:
             for slot, t in enumerate(before):
                 set_type(dev, slot, t)

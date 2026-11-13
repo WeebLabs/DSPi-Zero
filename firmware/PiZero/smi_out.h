@@ -9,9 +9,10 @@
 
 #define SMI_FRAME_WORDS 256u
 
-// Fills n frames starting at absolute frame `frame` into dst (n * SMI_FRAME_WORDS words). Called from the
-// DMA interrupt, a fixed lead ahead of the frame the SMI is sending.
-typedef void (*smi_compose_fn)(uint32_t frame, uint16_t *dst, uint32_t n);
+// Fills n frames starting at absolute frame `frame` into dst (n * SMI_FRAME_WORDS words), which is ring
+// frame ring_idx on. It may leave a frame whose words would be what that ring frame already holds, and
+// returns how many it wrote. Called from the DMA interrupt, a fixed lead ahead of the frame being sent.
+typedef uint32_t (*smi_compose_fn)(uint32_t frame, uint16_t *dst, uint32_t ring_idx, uint32_t n);
 
 typedef struct {
     uint32_t running;
@@ -25,11 +26,12 @@ typedef struct {
     uint32_t cs;            // SMI CS
     uint32_t dma_debug;
     uint32_t compose_cycles;    // CPU cycles spent composing, wrapping (needs the PMU cycle counter on)
-    uint32_t clean_cycles;      // and cleaning the composed frames out of the cache
+    uint32_t reused;            // composed frames whose ring frame already held them, so nothing was written
 } smi_out_status_t;
 
-// Starts streaming ring (ring_frames frames, a power of two, 64-byte aligned, cleaned from the cache
-// after each compose) on the GPIOs in pin_mask (SD0-SD15 are GPIO 8-23). Runs until stopped, composing as it goes.
+// Starts streaming ring (ring_frames frames, a multiple of 16, in non-cacheable memory so the DMA reads
+// what the composer wrote) on the GPIOs in pin_mask (SD0-SD15 are GPIO 8-23). Runs until stopped,
+// composing as it goes.
 bool smi_out_start(uint16_t *ring, uint32_t ring_frames, uint32_t freq, uint32_t pin_mask, smi_compose_fn compose);
 void smi_out_set_rate(uint32_t freq);
 
@@ -44,6 +46,7 @@ void smi_out_mck(uint32_t mult);
 void smi_out_pin(uint32_t gpio, bool on);
 uint32_t smi_out_frames(void);      // frames the DMA has read; safe from any context
 uint32_t smi_out_composed(void);    // frames composed so far, the reader position of the slot rings
+uint32_t smi_out_ring_index(uint32_t frame);    // the ring frame holding a frame composed within the last ring
 uint32_t smi_out_words2(void);      // frames the DMA has read, times 2, to 1/128 frame: I2S ring words
 void smi_out_status(smi_out_status_t *out);
 

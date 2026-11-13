@@ -1330,23 +1330,23 @@ void audio_i2s_mck_apply_state(uint pin, bool enabled, uint32_t sample_freq, uin
 // the same SMI cycle. Slot n's data is SD n (GPIO 8 + n); the I2S bit clock is SD4 (GPIO 12) and LRCLK
 // SD5 (GPIO 13). An S/PDIF cell lasts 2 words and an I2S bit clock 4, at every sample rate.
 
-#include <arm_acle.h>
-#include <arm_neon.h>
+#include "smi_frame.h"
 
 #define SMI_SLOTS 4u
-#define SMI_BIT_BCK 4u
-#define SMI_BIT_LRCLK 5u
 #define SMI_BIT_ADAT 8u   // SD8, GPIO 16, claimed only while ADAT is enabled
 #define SMI_PIN_MASK (0x3Fu << 8)
-#define SMI_RING_FRAMES 128u
+// One S/PDIF channel-status block, the period of a stream of silence: each ring frame then already holds
+// the frame it is next due, and the composer leaves it. The ring is not cached, so the DMA reads what
+// the NEON stores wrote with no cache maintenance.
+#define SMI_RING_FRAMES 192u
 
-static uint16_t smi_ring[SMI_RING_FRAMES * SMI_FRAME_WORDS] __attribute__((aligned(64)));   // cached; smi_out cleans it
+static uint16_t smi_ring[SMI_RING_FRAMES * SMI_FRAME_WORDS] __attribute__((section(".nocache"), aligned(64)));
+// What each ring frame was composed from (smi_frame.h).
+static uint32_t smi_key[SMI_RING_FRAMES][SMI_FRAME_KEY_WORDS] __attribute__((aligned(64)));
+static uint32_t smi_key_adat[SMI_RING_FRAMES][SMI_FRAME_ADAT_WORDS] __attribute__((aligned(32)));
 
 extern uint8_t slot_ring_store[];   // usb_audio.c: one PICO_AUDIO_SPDIF_RING_BYTES ring per slot
 
-static uint8_t lut_cell2[256][16] __attribute__((aligned(16)));    // 8 cells, bit 0 first, to 16 words
-static uint8_t lut_bck4[256][32] __attribute__((aligned(16)));     // 8 I2S bits to 32 words
-static uint8_t i2s_clock_bytes[SMI_FRAME_WORDS] __attribute__((aligned(16)));   // BCK and LRCLK, a byte a word
 static uint8_t lut_msb8[256][8] __attribute__((aligned(8)));     // 8 bits, MSB first, to 8 words
 
 // adat_output.c's stream: DMA channel 13 into pio1 SM 1, one bit per PIO cycle at 256 fs. The composer
@@ -1382,37 +1382,9 @@ typedef struct {
 static void smi_tables_init(void) {
     for (uint32_t v = 0; v < 256u; v++) {
         for (uint32_t j = 0; j < 8u; j++) {
-            uint8_t b = (uint8_t)((v >> j) & 1u);
-            lut_cell2[v][2u * j] = lut_cell2[v][2u * j + 1u] = b;
-            for (uint32_t k = 0; k < 4u; k++) {
-                lut_bck4[v][4u * j + k] = b;
-            }
-        }
-        for (uint32_t j = 0; j < 8u; j++) {
             lut_msb8[v][j] = (uint8_t)((v >> (7u - j)) & 1u);
         }
     }
-    // Philips I2S: BCK low then high within each bit (data changes on the falling edge), LRCLK low for
-    // the left half. Data runs one bit clock behind LRCLK, which the composer builds into the bit stream.
-    for (uint32_t w = 0; w < SMI_FRAME_WORDS; w++) {
-        uint32_t k = w / 4u;
-        i2s_clock_bytes[w] = (uint8_t)(((w % 4u) >= 2u) << SMI_BIT_BCK | (k >= 32u) << SMI_BIT_LRCLK);
-    }
-}
-
-// NRZI cells (1 = toggle) to line levels: a running XOR. Every subframe has an even number of
-// transitions, so each frame starts from the same level and needs no state from the last one.
-static inline uint32_t nrzi_levels(uint32_t x, uint32_t *carry) {
-    x ^= x << 1;
-    x ^= x << 2;
-    x ^= x << 4;
-    x ^= x << 8;
-    x ^= x << 16;
-    if (*carry) {
-        x = ~x;
-    }
-    *carry = x >> 31;
-    return x;
 }
 
 static uint32_t smi_gather(comp_slot_t *slots, bool *any_i2s) {
@@ -1438,74 +1410,76 @@ static uint32_t smi_gather(comp_slot_t *slots, bool *any_i2s) {
     return n;
 }
 
-static const uint8_t zero_row[32] __attribute__((aligned(16)));
-
-// Builds each frame 16 words at a time. Slot n is always bit n, so the four slots merge with shift-and-
-// insert (a disabled slot reads a row of zeros), then the clocks are ORed in and the block is widened.
-static void smi_compose(uint32_t frame, uint16_t *dst, uint32_t n) {
+// Hands smi_frames_a32 runs of frames in which no slot's ring wraps. A ring frame whose key shows the
+// same words is left as it is, which is every frame while the outputs are silent. After a change of
+// slot types, or a gap in what was composed, the keys are not trusted for one lap of the ring.
+static uint32_t smi_compose(uint32_t frame, uint16_t *dst, uint32_t ring_idx, uint32_t n) {
+    static const uint32_t zeros[4];
+    static uint32_t last_cfg, next_idx, stale_frames;
     comp_slot_t found[2u * SMI_SLOTS];
     bool any_i2s;
     uint32_t nf = smi_gather(found, &any_i2s);
-    const comp_slot_t *by_slot[SMI_SLOTS] = {NULL, NULL, NULL, NULL};
-    for (uint32_t s = 0; s < nf; s++) {
-        by_slot[found[s].bit] = &found[s];
-    }
+    const uint32_t *ring[SMI_SLOTS];
+    uint32_t offset[SMI_SLOTS], wrap[SMI_SLOTS][4];
     bool adat = adat_on;
-    for (uint32_t k = 0; k < n; k++, frame++, dst += SMI_FRAME_WORDS) {
-        const uint8_t *rows[SMI_SLOTS][16];   // per slot, the 16-byte table row for each block
+    smi_frame_job_t job = {.raw = {zeros, zeros, zeros, zeros}, .clocks = any_i2s, .msb8 = lut_msb8};
+    uint32_t cfg = 1u << 31 | (uint32_t)adat << 9 | (uint32_t)any_i2s << 8;
+    for (uint32_t s = 0; s < nf; s++) {
+        uint32_t slot = found[s].bit;
+        ring[slot] = found[s].ring;
+        offset[slot] = found[s].offset;
+        job.type[slot] = found[s].i2s ? SMI_SLOT_I2S : SMI_SLOT_SPDIF;
+        job.stride[slot] = found[s].i2s ? 8u : 16u;
+        cfg |= job.type[slot] << (2u * slot);
+    }
+    if (cfg != last_cfg || ring_idx != next_idx) {
+        stale_frames = SMI_RING_FRAMES;
+    }
+    last_cfg = cfg;
+    next_idx = ring_idx + n == SMI_RING_FRAMES ? 0 : ring_idx + n;
+    job.stale = stale_frames;
+    stale_frames -= n < stale_frames ? n : stale_frames;
+
+    uint32_t wrote = 0;
+    while (n) {
+        uint32_t run = n;
         for (uint32_t s = 0; s < SMI_SLOTS; s++) {
-            const comp_slot_t *c = by_slot[s];
-            if (!c) {
-                for (uint32_t q = 0; q < 16u; q++) {
-                    rows[s][q] = zero_row;
-                }
-            } else if (c->i2s) {
-                uint32_t rf = (frame + c->offset) & (PICO_AUDIO_I2S_RING_FRAMES - 1u);
-                uint32_t prev = (rf - 1u) & (PICO_AUDIO_I2S_RING_FRAMES - 1u);
-                // Bit clock 0 carries the last frame's right LSB, 1-32 the left word MSB first, 33-63 the
-                // right word's top 31 bits.
-                uint32_t lo = (c->ring[prev * 2u + 1u] & 1u) | __rbit(c->ring[rf * 2u]) << 1;
-                uint32_t hi = __rbit(c->ring[rf * 2u]) >> 31 | __rbit(c->ring[rf * 2u + 1u]) << 1;
-                for (uint32_t q = 0; q < 8u; q++) {
-                    rows[s][q] = &lut_bck4[(lo >> (4u * (q & ~1u))) & 0xFFu][16u * (q & 1u)];
-                    rows[s][q + 8u] = &lut_bck4[(hi >> (4u * (q & ~1u))) & 0xFFu][16u * (q & 1u)];
-                }
-            } else {
-                uint32_t rf = (frame + c->offset) & (PICO_AUDIO_SPDIF_RING_FRAMES - 1u);
-                const uint32_t *w = &c->ring[rf * 4u];
-                uint32_t carry = 0;
-                for (uint32_t j = 0; j < 4u; j++) {
-                    uint32_t lv = nrzi_levels(w[j], &carry);
-                    rows[s][4u * j] = lut_cell2[lv & 0xFFu];
-                    rows[s][4u * j + 1u] = lut_cell2[(lv >> 8) & 0xFFu];
-                    rows[s][4u * j + 2u] = lut_cell2[(lv >> 16) & 0xFFu];
-                    rows[s][4u * j + 3u] = lut_cell2[lv >> 24];
+            if (job.type[s] == SMI_SLOT_SPDIF) {
+                uint32_t rf = (frame + offset[s]) & (PICO_AUDIO_SPDIF_RING_FRAMES - 1u);
+                job.raw[s] = &ring[s][rf * 4u];
+                run = MIN(run, PICO_AUDIO_SPDIF_RING_FRAMES - rf);
+            } else if (job.type[s] == SMI_SLOT_I2S) {
+                // The frame before and this one, which wrap at the ring's start.
+                uint32_t at = ((frame + offset[s]) * 2u - 2u) & (PICO_AUDIO_I2S_RING_FRAMES * 2u - 1u);
+                job.raw[s] = &ring[s][at];
+                if (at > PICO_AUDIO_I2S_RING_FRAMES * 2u - 4u) {
+                    for (uint32_t j = 0; j < 4u; j++) {
+                        wrap[s][j] = ring[s][(at + j) & (PICO_AUDIO_I2S_RING_FRAMES * 2u - 1u)];
+                    }
+                    job.raw[s] = wrap[s];
+                    run = 1;
+                } else {
+                    run = MIN(run, (PICO_AUDIO_I2S_RING_FRAMES * 2u - 2u - at) / 2u);
                 }
             }
         }
-        // ADAT words are line levels, MSB first: each 16-word block takes half a word. They fill the
-        // high byte of each SMI word, so the store interleaves the two byte vectors.
-        const uint32_t *aw = adat ? &adat_ring[((frame - adat_start) % adat_ring_frames) * ADAT_FRAME_WORDS] : NULL;
-        for (uint32_t q = 0; q < 16u; q++) {
-            uint8x16_t acc = vld1q_u8(rows[0][q]);
-            acc = vsliq_n_u8(acc, vld1q_u8(rows[1][q]), 1);
-            acc = vsliq_n_u8(acc, vld1q_u8(rows[2][q]), 2);
-            acc = vsliq_n_u8(acc, vld1q_u8(rows[3][q]), 3);
-            if (any_i2s) {
-                acc = vorrq_u8(acc, vld1q_u8(&i2s_clock_bytes[16u * q]));
-            }
-            uint8x16x2_t out = {{acc, vdupq_n_u8(0)}};
-            if (aw) {
-                uint32_t bits = aw[q >> 1] >> ((q & 1u) ? 0u : 16u);
-                out.val[1] = vcombine_u8(vld1_u8(lut_msb8[(bits >> 8) & 0xFFu]), vld1_u8(lut_msb8[bits & 0xFFu]));
-            }
-            vst2q_u8((uint8_t *)&dst[16u * q], out);
+        if (adat) {
+            uint32_t af = (frame - adat_start) % adat_ring_frames;
+            job.adat = &adat_ring[af * ADAT_FRAME_WORDS];
+            job.adat_key = smi_key_adat[ring_idx];
+            run = MIN(run, adat_ring_frames - af);
         }
+        wrote += smi_frames_a32(dst, &job, smi_key[ring_idx], run);
+        frame += run;
+        ring_idx += run;
+        dst += run * SMI_FRAME_WORDS;
+        n -= run;
     }
     if (adat) {
         pico_shim_dma_hw.ch[ADAT_DMA_CH].read_addr =
             (uint32_t)(uintptr_t)&adat_ring[((frame - adat_start) % adat_ring_frames) * ADAT_FRAME_WORDS];
     }
+    return wrote;
 }
 
 // Starts the SMI stream (before DSPi creates its slots), and from then on the output clock is its frame count.
@@ -1518,13 +1492,18 @@ void shim_smi_start(void) {
 }
 
 // Bench: copies n frames that are composed but not yet sent, and returns the first one's frame number.
+// Interrupts stay on (the ring is slow to read), so a copy the composer caught up with is taken again.
 uint32_t shim_smi_snapshot(uint16_t *out, uint32_t n) {
-    uint32_t save = save_and_disable_interrupts();
-    uint32_t first = smi_out_frames() + 4u;     // composed (the composer is ahead) and not yet sent
-    for (uint32_t k = 0; k < n; k++) {
-        const uint16_t *src = &smi_ring[((first + k) & (SMI_RING_FRAMES - 1u)) * SMI_FRAME_WORDS];
-        memcpy(&out[k * SMI_FRAME_WORDS], src, SMI_FRAME_WORDS * 2u);
+    uint32_t first = 0;
+    for (uint32_t tries = 0; tries < 4u; tries++) {
+        first = smi_out_frames() + 4u;     // composed (the composer is ahead) and not yet sent
+        uint32_t idx = smi_out_ring_index(first);
+        for (uint32_t k = 0; k < n; k++, idx = idx + 1u == SMI_RING_FRAMES ? 0 : idx + 1u) {
+            memcpy(&out[k * SMI_FRAME_WORDS], &smi_ring[idx * SMI_FRAME_WORDS], SMI_FRAME_WORDS * 2u);
+        }
+        if (smi_out_composed() - first < SMI_RING_FRAMES) {
+            break;
+        }
     }
-    restore_interrupts(save);
     return first;
 }

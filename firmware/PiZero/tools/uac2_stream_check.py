@@ -65,9 +65,9 @@ def read_stats(dev, raw=None):
 
 
 class Tone:
-    """-20 dBFS 1 kHz stereo tone on a PortAudio stream opened on one named device."""
+    """-20 dBFS stereo tone (1 kHz unless hz says otherwise) on a PortAudio stream opened on one named device."""
 
-    def __init__(self, device_substring, rate=48000, set_device_rate=False):
+    def __init__(self, device_substring, rate=48000, set_device_rate=False, hz=1000):
         import sounddevice as sd
         self.sd = sd
         self.rate = rate
@@ -84,7 +84,7 @@ class Tone:
         self.pos = 0
         one = bytearray()
         for i in range(rate):
-            v = int(self.amp * math.sin(2 * math.pi * 1000 * i / rate))
+            v = int(self.amp * math.sin(2 * math.pi * hz * i / rate))
             one += struct.pack("<hh", v, v)
         self.buf = bytes(one)
 

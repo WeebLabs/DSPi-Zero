@@ -5,7 +5,6 @@
 #include "smi_out.h"
 
 #include "irq.h"
-#include "broadcom/caches.h"
 #include "mbox.h"
 #include "pll_out.h"
 
@@ -68,6 +67,7 @@ static dma_cb_t cbs[MAX_CHUNKS] __attribute__((section(".nocache"), aligned(32))
 static smi_out_status_t st = {.dma_channel = 0xFF};
 static uint16_t *ring;
 static uint32_t ring_frames, ring_bus, ring_bytes;
+static uint32_t comp_idx;           // ring frame the next composed frame goes to
 static smi_compose_fn compose;
 static uint32_t last_off_words;     // DMA offset in the ring at the last read, words
 static uint32_t word_rem;           // words read past the last whole frame
@@ -168,7 +168,7 @@ static void track_words(bool infer_rings) {
         return;     // between control blocks
     }
     uint32_t n = ring_bytes / 2u;
-    uint32_t d = (off - last_off_words) & (n - 1u);
+    uint32_t d = off >= last_off_words ? off - last_off_words : off + n - last_off_words;
     // Add whole rings so the advance is the one nearest what the elapsed time predicts.
     uint32_t expect = (uint32_t)((uint64_t)(now - last_us) * st.freq * SMI_FRAME_WORDS / 1000000u);
     if (infer_rings && expect > d + n / 2u) {
@@ -196,27 +196,25 @@ static void service(void) {
     }
     if ((int32_t)(st.composed - pos) < 2) {
         st.late++;
+        comp_idx = (comp_idx + (pos + 2u - st.composed)) % ring_frames;
         st.composed = pos + 2u;     // the next couple of frames are already in the SMI FIFO or on the bus
     }
     uint32_t target = pos + LEAD_FRAMES;
+    uint32_t c0;
+    __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(c0));   // PMCCNTR
     while ((int32_t)(target - st.composed) > 0) {
-        uint32_t idx = st.composed & (ring_frames - 1u);
         uint32_t n = target - st.composed;
-        if (n > ring_frames - idx) {
-            n = ring_frames - idx;
+        if (n > ring_frames - comp_idx) {
+            n = ring_frames - comp_idx;
         }
-        uint32_t c0;
-        __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(c0));   // PMCCNTR
-        compose(st.composed, &ring[idx * SMI_FRAME_WORDS], n);
-        uint32_t cm;
-        __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(cm));
-        data_clean(&ring[idx * SMI_FRAME_WORDS], n * SMI_FRAME_WORDS * 2u);  // out to SDRAM for the DMA
-        uint32_t c1;
-        __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(c1));
-        st.compose_cycles += cm - c0;
-        st.clean_cycles += c1 - cm;
+        st.reused += n - compose(st.composed, &ring[comp_idx * SMI_FRAME_WORDS], comp_idx, n);
         st.composed += n;
+        comp_idx = comp_idx + n == ring_frames ? 0 : comp_idx + n;
     }
+    __asm__ volatile("dsb" ::: "memory");   // the ring is not cached: this drains the write buffer
+    uint32_t c1;
+    __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(c1));
+    st.compose_cycles += c1 - c0;
 }
 
 static void dma_irq(void) {
@@ -226,8 +224,7 @@ static void dma_irq(void) {
 }
 
 bool smi_out_start(uint16_t *r, uint32_t frames, uint32_t freq, uint32_t pin_mask, smi_compose_fn fn) {
-    if (st.running || (frames & (frames - 1u)) || frames % CHUNK_FRAMES || frames / CHUNK_FRAMES > MAX_CHUNKS ||
-        frames < 2u * LEAD_FRAMES) {
+    if (st.running || frames % CHUNK_FRAMES || frames / CHUNK_FRAMES > MAX_CHUNKS || frames < 2u * LEAD_FRAMES) {
         return false;
     }
     if (st.dma_channel == 0xFF) {
@@ -263,15 +260,14 @@ bool smi_out_start(uint16_t *r, uint32_t frames, uint32_t freq, uint32_t pin_mas
     for (uint32_t i = 0; i < frames * SMI_FRAME_WORDS; i++) {
         r[i] = 0;
     }
-    data_clean(r, frames * SMI_FRAME_WORDS * 2u);
     st.frames = 0;
     st.composed = 0;
     word_rem = 0;
     last_off_words = 0;
     l_refresh_at = 0;
-    compose(0, r, LEAD_FRAMES);
-    data_clean(r, LEAD_FRAMES * SMI_FRAME_WORDS * 2u);
+    compose(0, r, 0, LEAD_FRAMES);
     st.composed = LEAD_FRAMES;
+    comp_idx = LEAD_FRAMES;
 
     uint32_t chunk_bytes = CHUNK_FRAMES * SMI_FRAME_WORDS * 2u;
     uint32_t n_cbs = frames / CHUNK_FRAMES;
@@ -362,6 +358,14 @@ uint32_t smi_out_words2(void) {
 
 uint32_t smi_out_composed(void) {
     return st.composed;     // one word, written only by the DMA interrupt
+}
+
+uint32_t smi_out_ring_index(uint32_t frame) {
+    uint32_t save = irq_global_disable();
+    uint32_t back = (st.composed - frame) % ring_frames;
+    uint32_t idx = comp_idx >= back ? comp_idx - back : comp_idx + ring_frames - back;
+    irq_global_restore(save);
+    return idx;
 }
 
 void smi_out_status(smi_out_status_t *out) {
