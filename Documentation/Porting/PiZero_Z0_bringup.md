@@ -715,6 +715,7 @@ DSPi's ADAT output now runs, on GPIO 16 (SMI SD8, header pin 36). As with the ot
 
 **Cost.** The composer takes 1185 cycles a frame with ADAT running, against 900 without it (885 before this change). The extra is about 1.4% of the 1 GHz CPU at 48 kHz.
 *Update (2026-11-12): with the composer of section 27 it is 436 cycles a frame with ADAT running and every frame written, against 350 without it.*
+*Update (2026-11-13): `adat_output.c` is no longer compiled. The port's `z4/adat_output_pi.c` gives DSPi the same API with a ring of samples, and the composer encodes them (section 29). The start and stop, the progress in DMA channel 13 and the main-loop calls described above are unchanged.*
 
 **Not covered.** No ADAT receiver has decoded the pin. ADAT's 96 kHz mode (S/MUX) is not offered, because DSPi does not offer it on the RP2350 either.
 
@@ -865,7 +866,7 @@ All S/PDIF reads 355 playing and 91 silent, all I2S 353 and 81. At 44.1 and 96 k
 | USB tone at 96 kHz, 997 Hz | 21.2% | 14.1% | 5.8% |
 
 **Where the rest goes.**
-- **Playing.** The 512 bytes of a frame take about 275 cycles to reach the uncached ring, whatever the stores are: sixteen `vst4.8`, sixteen 32-byte `vst1` and thirty-two 16-byte `vst1` all measured the same, with nothing else in the loop. The composing hides under that. Taking the sixteen polynomial multiplies out, or the whole merge, changed the total by under 6 cycles. So the cost of a written frame is now the memory write, and only writing fewer bytes would lower it.
+- **Playing.** The 512 bytes of a frame take about 275 cycles to reach the uncached ring, whatever the stores are: sixteen `vst4.8`, sixteen 32-byte `vst1` and thirty-two 16-byte `vst1` all measured the same, with nothing else in the loop. The composing hides under that. *(Update, section 29: it does not. Work added before or between the stores costs its full time.)* Taking the sixteen polynomial multiplies out, or the whole merge, changed the total by under 6 cycles. So the cost of a written frame is now the memory write, and only writing fewer bytes would lower it.
 - **Silent.** Of the 72 cycles, 25 are the per-interrupt work in C (reading DSPi's slot state, 400 cycles an interrupt) and 47 the comparison: six NEON loads, which take about 20 cycles when repeated on lines already in the cache, and a remainder that prefetching did not move and that has not been traced.
 
 **Tried, not kept.**
@@ -895,6 +896,8 @@ All S/PDIF reads 355 playing and 91 silent, all I2S 353 and 81. At 44.1 and 96 k
 With the composer cheap (section 27), DSPi's audio blocks were the largest load while a tone played, and 44% of a block was the shim writing S/PDIF: `audio_spdif_ring_write_s32` encoded every sample into biphase cells through a lookup table, and `audio_spdif_stamp_silence_run` wrote the erase-ahead silence as cells. The rings now hold plain samples and the composer does the encoding. The pins carry the same bits as before.
 
 **Who reads the rings.** Only the shim's ring writers and the composer touch a slot ring's contents. DSPi itself tests `inst->ring` for NULL and passes `slot_ring_store[i]` as the base, and it never reads a word. ADAT has its own ring (`adat_output.c`), the bench snapshot reads the SMI ring, and no tool reads a slot ring. So the format is the shim's own to choose.
+
+*Update (2026-11-13): the ADAT ring went the same way in section 29. It holds samples, in the port's own `z4/adat_output_pi.c`, and the composer encodes them.*
 
 **The ring format** (`smi_frame.h`). A frame is two words, left then right, where it was four. A word has one bit for each of its subframe's 32 time slots.
 
@@ -943,3 +946,98 @@ In the block profile (`z4_prof.py`) the two S/PDIF functions were 43% of the sam
 - Feeding the composer's merge the first and second halves separately would save the eight extra `vmull.p8` that four S/PDIF slots now cost, about the 3 cycles a frame the playing figure rose by. It means rewriting the merge in both the C and the assembly for under 0.02% of the core, so it was left.
 
 **Not covered.** No receiver or DAC has listened to the pins since the change; the checks decode the composed stream, not the wire. A change of slot type while audio plays is covered only by `smi_check.py` switching types between runs. Rates other than 44.1, 48 and 96 kHz (status byte 0x01) are covered by the unit test only.
+
+
+## 29. The ADAT ring holds samples, and the composer encodes
+
+*Added: 2026-11-13*
+
+With ADAT enabled the core carried 2.3 points more load while a tone played (9.87% against 7.61%). DSPi's `adat_output.c` encoded every frame into 256 line levels as it was pushed, through a table and a chain of 24 dependent lookups, and that alone was 11 us of a 39 us block. The ADAT ring now holds plain samples, in a module of the port's own, and the composer encodes them. One compiler option then shortens DSPi's block itself. The pins carry the same bits as before, and the load with ADAT enabled is 8.35%.
+
+**Where the load was** (four S/PDIF slots, 48 kHz, 997 Hz tone, DSPi Console's analyser running). Enabling ADAT added 0.57 points of interrupt time and 1.67 points of producer time.
+- **The interrupts** were the composer, at 476 cycles a frame against 358.
+- **The producer** was all inside `process_input_block`, which went from 22.4 to 39.1 us (`z4_perf.py`, which counts cycles; DSPi's own `block_us_avg` is a slow average and reads lower for a while after ADAT is enabled). The keep-alive and `adat_output_task` cost nothing that the meter can see, and the services figure did not move.
+- **Inside the block**, `adat_output_push_block` took 11.1 us, which is 231 cycles a frame. Another 5 us is DSPi's S24 staging. While ADAT is active DSPi converts each output row to integers in place and then interleaves them, where it otherwise does both in one pass. The in-place loop is one chain of VFP operations a sample, and the in-order A53 waits out each chain, so it costs 16 cycles a sample where the fused loop's two chains cost 8. The rest is the cache. The ADAT ring is 18 KB, each block writes 24 lines of it that the cache no longer holds, and the block's L1D refills rose from 91 to 139.
+
+**The module.** `z4/adat_output_pi.c` is DSPi's `adat_output.c` with the encoder taken out, and `adat_output.c` is no longer in the build. It keeps every function and every line of the accounting, so `diff` against DSPi's file shows only the ring's contents.
+- **What DSPi's callers use**, read in `audio_pipeline.c`, `vendor_commands.c`, `bulk_params.c`, `flash_storage.c`, `dac_hw_mute.c`, `control_surfaces_nouns.c` and `main.c` (whose calls `z4_mainloop.c` repeats). They are the configuration with its dirty flag, which `bulk_params.c` and `flash_storage.c` also write directly, the status packet, `adat_output_is_active()`, which chooses DSPi's S24 staging for the block, the push, the slot-skip mirror, the keep-alive from the main loop and from the stall alarm, the task, the resync, the stop and the pin release. All are the same code as DSPi's.
+- **PIO and DMA calls are kept.** The shim still starts and stops ADAT when pio1 SM 1 is enabled and disabled, takes the ring from DMA channel 13, and moves that channel's read address on as it composes. So the lead of 96 frames behind slot 0, the keep-alive, the resync and slip counters and the pin handling work as they did.
+- **The ring** is aligned to a cache line. Left as DSPi declares it, it began 40 bytes into a line in this image, so every second frame lay across two lines. Aligning it took 8 cycles a frame off the composer and 0.5 us off the block.
+
+**The ring format** (`smi_frame.h`). A frame is still 8 words, so the ring's size and the read address arithmetic are DSPi's.
+
+| Word | Holds |
+|---|---|
+| 0 to 7 | channel 1 to 8's sample in bits 0 to 23 |
+| 7, bit 31 | the line level the frame starts from |
+
+A frame sends an even number of 1 bits apart from its samples' own (2 in the sync pattern and 6 before the nibbles of each sample). So it ends at its starting level XOR the parity of its eight samples, which is how `smi_adat_write` carries the level from frame to frame, and a silent frame leaves the level as it found it. Because each frame carries its own starting level it can be composed alone, which the composer needs since it skips frames that the SMI ring already holds.
+
+**Writing.** `smi_adat_write` turns DSPi's eight rows into frames four at a time in NEON. It masks the samples to 24 bits, XORs the rows for the parities, and transposes rows to frames with `vzip`. It costs 1.4 us a block, of which 0.3 us is the ring's cache misses, against 11.1 us.
+
+**Encoding** (`smi_adat_levels` in C, `ADATLEVELS` in `smi_frame_a32.S`). The 256 levels are built with the first one sent in bit 0, which is the order the composer stores words in.
+- **Reversal.** A sample is sent MSB first, so each word is bit-reversed. AArch32 NEON has no bit reversal, so the eight words go through core registers (`rbit`).
+- **The 1 before each nibble.** Nibble g of the reversed sample moves from bit 4g + 1 to bit 5g + 1 in three steps of shift and select (up 4, up 2, up 1), and the six 1 bits are ORed in. That is 30 bits a sample, all eight samples at once.
+- **Packing.** Two samples make 60 bits (`vsli`), and the four 60-bit fields follow the 16 bits of sync into four 64-bit words.
+- **NRZI.** A 1 is a change of level, so the levels are the running XOR of the bits, which is six shift-and-XOR steps in 64-bit lanes. Each 64 bits is then inverted if the level before it is 1, which is the frame's starting level XORed with the last level of each 64 before.
+- **One level a word.** Squaring a byte as a polynomial (`vmull.p8`) moves bit i to bit 2i. Twice gives a byte for each cell time with its two words' levels in bits 0 and 4, which a shift and a mask split into the two high bytes that `vst4.8` stores beside the cell's low byte. The 256-entry table and its 32 loads a frame are gone.
+
+**Proof that the bits are the same.** `tests/smi_frame_test.c` keeps DSPi's encoder (`adat_encode_frame` and its tables, as in `adat_output.c`). It prints PASS on the Mac and under QEMU.
+- Runs of 1 to 192 frames of random, all-zero, all-one, sparse and sign-extended samples, and runs of silence, go through DSPi's encoder a frame at a time and through `smi_adat_write` and `smi_adat_silence`, from a random line level. Every frame's 256 levels must equal DSPi's words bit for bit, and the level carried out must agree.
+- In the composer tests the table-driven reference plays DSPi's words, and `smi_frames_c` and `smi_frames_a32` compose the new ring frames. All 256 words must match for every mix of slot types and clocks, and the keys must skip only a repeat.
+- Under QEMU the assembly is also checked against the C on arbitrary ring words.
+
+**What it costs now** (four S/PDIF slots, 48 kHz, 997 Hz tone, analyser running). The middle column is the ring change alone.
+
+| Measure | Before | Ring holds samples | And loops unrolled |
+|---|---|---|---|
+| Whole core, ADAT on | 9.87% | 9.07% | 8.35% |
+| Interrupts, ADAT on | 4.05% | 4.09% | 4.14% |
+| Producer, ADAT on | 4.43% | 3.60% | 2.83% |
+| Composer, ADAT on, cycles a frame | 476 | 487 to 495 | 494 |
+| DSPi block, ADAT on | 39.1 us | 31.1 us | 22.4 us |
+| Whole core, ADAT off | 7.61% | 7.63% | 7.21% |
+| Producer, ADAT off | 2.73% | 2.78% | 2.34% |
+| Composer, ADAT off, cycles a frame | 358 | 357 | 358 |
+| DSPi block, ADAT off | 22.4 us | 22.5 us | 18.2 us |
+| Whole core, no stream, ADAT on | 1.08% | 1.05% | 1.06% |
+| Whole core, no stream, ADAT off | 0.90% | 0.91% | 0.89% |
+| Composer, no stream, ADAT on, cycles a frame | 121 | 116 | 117 |
+| Whole core, tone at 96 kHz, ADAT off | 12.9% | | 12.1% |
+
+The block profile (`z4_prof.py`) with ADAT on was `process_input_block` 38.8%, `adat_output_push_block` 28.4%, `rta_bass_push` 15.8% and `audio_spdif_ring_write_s32` 7.3% of 39.1 us. It is now 40.6%, 4.8%, 29.5% and 8.9% of 22.4 us.
+
+**Unrolled loops.** `audio_pipeline.c` is now compiled with `-funroll-loops`, one line in `CMakeLists.txt`. This is separate from the ring change and can be dropped on its own. DSPi's sample loops (the mix, the gain, the delays, the peaks and the S24 conversion) are each one chain of VFP operations a sample. GCC does not vectorise float loops for 32-bit NEON without `-funsafe-math-optimizations`, which would change results, and on the in-order A53 a loop of one chain runs at the chain's latency. Unrolled, GCC overlaps the chains of several samples. No arithmetic changes. It takes 4.2 us off every block with ADAT off, and 8.7 us with ADAT on, where the in-place S24 pass gains most.
+
+**The composer does not get cheaper.** Section 27 took the composer's arithmetic to hide under its stores to the uncached ring. It does not, as extra instructions put in the frame path showed.
+- A NEON instruction on Q registers costs about 0.9 cycles and one on D registers 0.4, whether it comes before the stores or between them, and whether or not it depends on the one before. 140 on Q registers before the stores cost 134 cycles, and 128 between the stores cost 109.
+- A NEON load costs a cycle for each 8 bytes.
+- So the encoding costs what its instructions cost wherever it runs. In the composer it is 136 cycles a frame over a frame without ADAT, which is 18 more than the table lookups it replaced. Of the 136, 64 are the key, the pointers and the one-level-a-word step, 16 the reversal through core registers, and 56 the rest of the encoding.
+- It stayed in the composer because a frame that the SMI ring already holds is then not encoded at all, as when a stream is open and silent.
+
+**Tried, not kept.**
+- The running XOR in 32-bit lanes, with the eight lane levels chained through `vext`: 537 cycles a frame against 519 for 64-bit lanes with the chain in D registers.
+- The four constant vectors loaded from `.rodata` in every frame: two such loads cost 24 cycles more than the same loads from the stack, every frame, for a reason that was not traced. The function now copies them to its stack once a call (519 to 495).
+- Prefetching the ADAT ring in the composer (`pld` two frames ahead), in the writer (`pldw` three iterations ahead), and at the end of a push for the lines the next block will write: no change in any of the three.
+- Encoding in the writer and only spreading the levels in the composer was counted, not built. The composer would fall to about 420 cycles a frame and the block rise by about 3.5 us, the same total, and silent frames would still be encoded.
+- Taking ADAT's samples from the slot rings, so that `adat_output_is_active()` could say no and DSPi keep its fused pass. A slot whose two outputs are disabled is written as zeros while ADAT still carries its channels, and a slot that is not enabled gets no ring writes at all, so ADAT would not be DSPi's in those cases. Not done.
+- A change to DSPi's `adat_output.c` was not needed, and the submodule is untouched.
+
+**Checks on the board**, on the image described here.
+- `adat_check.py --watch 30`: at 48 kHz channel 1 equalled slot 0's I2S word frame for frame, at 44.1 kHz the lag read 7.80 frames, at 96 kHz the pin was held low, and with ADAT disabled GPIO 16 was an input. 30 s at each rate showed no underruns, drops, late compositions, resyncs or slips. With the 1 kHz tone, which repeats in the ring, the composer took 181 cycles a frame (168 before).
+- `smi_check.py` with I2S/S/PDIF mixed and all S/PDIF, at 44.1, 48 and 96 kHz, with ADAT enabled and disabled: every slot decoded in all 12. `smi_check.py --watch 60` with ADAT enabled: no underruns, drops or late compositions.
+- `spdif_cs_check.py` at the three rates and silent, `mck_check.py` and `output_toggle_check.py` passed with ADAT enabled.
+- `spdif_in_check.py --source --watch 20` with ADAT enabled: locked throughout, no decode or parity errors, no underruns. This is also the case of 192-frame blocks.
+- **Sample for sample against the image before.** The Mac plays a table of 48,000 samples that it repeats, and DSPi's default path maps each input sample to one output sample. A bench script aligns each snapshot to the table and collects that map for slot 0's left and right and for ADAT channels 1 and 2. On this image the map was a function over 900 snapshots with every run aligned, and ADAT agreed with slot 0 on 8,466 shared input values. Against the image before, with ADAT on and off, the maps agreed on every shared input value (between 1,200 and 2,300 for each of the four, and as many for ADAT against slot 0 across the two images).
+- **Enable, disable and rate changes.** A second bench script toggled ADAT 12 times while a tone played, changed the rate six times through 44.1, 96 and 48 kHz, toggled it four times while silent at each rate, and toggled it 20 times at 8 a second. After each step it decoded 15 ADAT frames (sync, forced bits, user bits, channels 3 to 8 silent, and the tone's samples on channels 1 and 2, or silence), and read the status and the pin. Every step was right, with 29 resyncs, no slips and no late compositions. The image before gave the same 29 resyncs and the same pin at every step, including that ADAT enabled while already at 96 kHz leaves the pin an input.
+
+**Not covered.**
+- No ADAT receiver has decoded the pin. The checks decode the composed SMI stream.
+- `adat_output_pi.c` must follow any change DSPi makes to `adat_output.c`. Nothing checks that it does.
+- The unrolled loops were compared sample for sample only on the default path with a tone at 48 kHz. Loops in `audio_pipeline.c` that the default path does not run (several sources mixed into one output, gain ramps, output delays) were not compared between the two images.
+- A change of the ADAT pin, and ADAT restored from a preset, from bulk parameters or from flash, were not run. That code is DSPi's, unchanged.
+- The two bench scripts are not in the tree.
+
+**Further, not done.**
+- With ADAT on the block is still 4.2 us longer than with it off. About 1.1 us is the push and the rest is DSPi's in-place S24 pass and second interleave, which only a change in `output_s24.h` or `audio_pipeline.c` would remove.
+- `rta_bass_push` is now 30% of the block. `rta_bass.c` and `dsp_pipeline.c` were not tried with `-funroll-loops`.

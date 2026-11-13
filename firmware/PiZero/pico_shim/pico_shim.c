@@ -277,7 +277,7 @@ static void shim_adat_enable(bool on);
 
 void pio_sm_set_enabled(PIO pio, uint sm, bool enabled) {
     if (PIO_NUM(pio) == 1u && sm == 1u) {
-        shim_adat_enable(enabled);  // adat_output.c's state machine
+        shim_adat_enable(enabled);  // the ADAT output's state machine
     }
     if (enabled) {
         pio->ctrl |= 1u << sm;
@@ -1302,11 +1302,10 @@ static uint32_t smi_key_adat[SMI_RING_FRAMES][SMI_FRAME_ADAT_WORDS] __attribute_
 
 extern uint8_t slot_ring_store[];   // usb_audio.c: one PICO_AUDIO_SPDIF_RING_BYTES ring per slot
 
-static uint8_t lut_msb8[256][8] __attribute__((aligned(8)));     // 8 bits, MSB first, to 8 words
-
-// adat_output.c's stream: DMA channel 13 into pio1 SM 1, one bit per PIO cycle at 256 fs. The composer
-// plays the ring that channel was given from the frame the state machine was enabled, one bit per SMI
-// word on SD8, and moves the channel's read address on as it composes, as the DMA would.
+// The ADAT stream (z4/adat_output_pi.c, as DSPi's adat_output.c): DMA channel 13 into pio1 SM 1. The
+// composer plays the ring that channel was given from the frame the state machine was enabled, encoding
+// each ring frame's samples to one line level per SMI word on SD8 (smi_frame.h), and moves the channel's
+// read address on as it composes, as the DMA would.
 #define ADAT_DMA_CH 13u
 #define ADAT_FRAME_WORDS 8u
 static const uint32_t *adat_ring;
@@ -1333,14 +1332,6 @@ typedef struct {
     uint8_t bit;
     uint8_t i2s;
 } comp_slot_t;
-
-static void smi_tables_init(void) {
-    for (uint32_t v = 0; v < 256u; v++) {
-        for (uint32_t j = 0; j < 8u; j++) {
-            lut_msb8[v][j] = (uint8_t)((v >> (7u - j)) & 1u);
-        }
-    }
-}
 
 static uint32_t smi_gather(comp_slot_t *slots, bool *any_i2s) {
     uint32_t n = 0;
@@ -1377,7 +1368,7 @@ static uint32_t smi_compose(uint32_t frame, uint16_t *dst, uint32_t ring_idx, ui
     const uint32_t *ring[SMI_SLOTS];
     uint32_t offset[SMI_SLOTS], wrap[SMI_SLOTS][4];
     bool adat = adat_on;
-    smi_frame_job_t job = {.raw = {zeros, zeros, zeros, zeros}, .clocks = any_i2s, .msb8 = lut_msb8};
+    smi_frame_job_t job = {.raw = {zeros, zeros, zeros, zeros}, .clocks = any_i2s};
     uint32_t cfg = 1u << 31 | (uint32_t)adat << 9 | (uint32_t)any_i2s << 8;
     for (uint32_t s = 0; s < nf; s++) {
         uint32_t slot = found[s].bit;
@@ -1450,7 +1441,6 @@ static uint32_t smi_compose(uint32_t frame, uint16_t *dst, uint32_t ring_idx, ui
 // Starts the SMI stream (before DSPi creates its slots), and from then on the output clock is its frame count.
 void shim_smi_start(void) {
     smi_spdif_silence_init(spdif_idle, spdif_channel_status);
-    smi_tables_init();
     if (smi_out_start(smi_ring, SMI_RING_FRAMES, oc_freq, SMI_PIN_MASK, smi_compose)) {
         oc_smi = true;
     }

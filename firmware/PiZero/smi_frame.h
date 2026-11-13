@@ -15,6 +15,14 @@ enum { SMI_SLOT_OFF, SMI_SLOT_SPDIF, SMI_SLOT_I2S };
 #define SMI_FRAME_KEY_WORDS 16u     // what a frame was made from: 4 words a slot
 #define SMI_FRAME_ADAT_WORDS 8u
 
+// An ADAT ring frame is 8 words, channel c's 24-bit sample in bits 0 to 23 of word c, and the composer
+// encodes it (bring-up section 29). Bit 31 of word 7 is the line level the frame starts from, so a frame
+// stands alone. A frame sends an even number of 1 bits apart from its samples', so it ends at that level
+// XOR the parity of its samples.
+#define SMI_ADAT_SAMPLE 0x00FFFFFFu
+#define SMI_ADAT_LEVEL (1u << 31)   // in word 7
+#define SMI_ADAT_SYNC 0x0801u       // sent first, from bit 0 (a 1, ten 0s, a 1 and four user bits of 0)
+
 // An S/PDIF slot ring holds two words a frame, left then right, which the composer encodes. A word has
 // one bit for each of its subframe's 32 time slots, stored so that a running XOR over the word gives the
 // line level in the second half of every slot. Biphase mark toggles the line at each slot's start and
@@ -79,16 +87,103 @@ static inline void smi_spdif_write(uint32_t *ring, uint32_t ring_frames, const u
     }
 }
 
+// n ADAT ring frames at f from 8 rows of samples (channel c's sample i is rows[c * row_words + i]), which
+// may be sign-extended. level is the line level before the first frame. Returns the level after the last.
+static inline uint32_t smi_adat_write(uint32_t *f, const int32_t *rows, uint32_t row_words, uint32_t n,
+                                      uint32_t level) {
+    const uint32x4_t mask = vdupq_n_u32(SMI_ADAT_SAMPLE);
+    uint32x4_t lv = vdupq_n_u32(level & 1u);
+    uint32_t i = 0;
+#define SMI_ADAT_ROW(c) vandq_u32(vreinterpretq_u32_s32(vld1q_s32(&rows[(c) * row_words + i])), mask)
+    for (; i + 4u <= n; i += 4u, f += 32) {
+        uint32x4_t r0 = SMI_ADAT_ROW(0), r1 = SMI_ADAT_ROW(1), r2 = SMI_ADAT_ROW(2), r3 = SMI_ADAT_ROW(3);
+        uint32x4_t r4 = SMI_ADAT_ROW(4), r5 = SMI_ADAT_ROW(5), r6 = SMI_ADAT_ROW(6), r7 = SMI_ADAT_ROW(7);
+        uint32x4_t x = veorq_u32(veorq_u32(veorq_u32(r0, r1), veorq_u32(r2, r3)),
+                                 veorq_u32(veorq_u32(r4, r5), veorq_u32(r6, r7)));
+        // Each frame's parity, then the level before each of the four and after the last.
+        uint32x4_t p = vandq_u32(vpaddlq_u16(vpaddlq_u8(vcntq_u8(vreinterpretq_u8_u32(x)))), vdupq_n_u32(1));
+        p = veorq_u32(p, vreinterpretq_u32_u64(vshlq_n_u64(vreinterpretq_u64_u32(p), 32)));
+        p = veorq_u32(p, vcombine_u32(vdup_n_u32(0), vdup_lane_u32(vget_low_u32(p), 1)));
+        p = veorq_u32(p, lv);
+        r7 = vorrq_u32(r7, vshlq_n_u32(vextq_u32(lv, p, 3), 31));
+        lv = vdupq_lane_u32(vget_high_u32(p), 1);
+        // Rows to frames, four at a time.
+        uint32x4x2_t a = vzipq_u32(r0, r2), b = vzipq_u32(r1, r3), c = vzipq_u32(r4, r6), d = vzipq_u32(r5, r7);
+        uint32x4x2_t lo01 = vzipq_u32(a.val[0], b.val[0]), lo23 = vzipq_u32(a.val[1], b.val[1]);
+        uint32x4x2_t hi01 = vzipq_u32(c.val[0], d.val[0]), hi23 = vzipq_u32(c.val[1], d.val[1]);
+        vst1q_u32(&f[0], lo01.val[0]);
+        vst1q_u32(&f[4], hi01.val[0]);
+        vst1q_u32(&f[8], lo01.val[1]);
+        vst1q_u32(&f[12], hi01.val[1]);
+        vst1q_u32(&f[16], lo23.val[0]);
+        vst1q_u32(&f[20], hi23.val[0]);
+        vst1q_u32(&f[24], lo23.val[1]);
+        vst1q_u32(&f[28], hi23.val[1]);
+    }
+#undef SMI_ADAT_ROW
+    level = vgetq_lane_u32(lv, 0);
+    for (; i < n; i++, f += 8) {
+        uint32_t x = 0;
+        for (uint32_t c = 0; c < 8u; c++) {
+            f[c] = (uint32_t)rows[c * row_words + i] & SMI_ADAT_SAMPLE;
+            x ^= f[c];
+        }
+        f[7] |= level << 31;
+        level ^= (uint32_t)__builtin_parity(x);
+    }
+    return level;
+}
+
+// n silent ADAT ring frames at f, which leave the line at the level they start from.
+static inline void smi_adat_silence(uint32_t *f, uint32_t n, uint32_t level) {
+    const uint32x4_t zero = vdupq_n_u32(0), last = vsetq_lane_u32(level << 31, zero, 3);
+    for (uint32_t i = 0; i < n; i++, f += 8) {
+        vst1q_u32(f, zero);
+        vst1q_u32(f + 4, last);
+    }
+}
+
+// An ADAT ring frame's 256 line levels, the first sent in bit 0 of w[0]. Each sample is sent MSB first
+// as six nibbles, a 1 before each, after the sync pattern, and a 1 is a change of level (NRZI). So the
+// sample is reversed, nibble g moved to bit 5g + 1, and the levels are the running XOR of all 256 bits.
+static inline void smi_adat_levels(const uint32_t *f, uint32_t w[8]) {
+    uint64_t acc = SMI_ADAT_SYNC;
+    uint32_t have = 16, k = 0, level = f[7] >> 31;
+    for (uint32_t c = 0; c < 8u; c++) {
+        uint32_t t = __rbit(f[c]) >> 7;
+        t = (t & ~0xFFE00000u) | (t << 4 & 0xFFE00000u);    // nibbles 4 and 5 up 4
+        t = (t & ~0x0007F800u) | (t << 2 & 0x0007F800u);    // nibbles 2 and 3 up 2
+        t = (t & ~0x3C0F03C0u) | (t << 1 & 0x3C0F03C0u);    // nibbles 1, 3 and 5 up 1
+        t |= 0x02108421u;
+        acc |= (uint64_t)t << have;
+        have += 30u;
+        if (have >= 32u) {
+            w[k++] = (uint32_t)acc;
+            acc >>= 32;
+            have -= 32u;
+        }
+    }
+    for (k = 0; k < 8u; k++) {
+        uint32_t x = w[k];
+        x ^= x << 1;
+        x ^= x << 2;
+        x ^= x << 4;
+        x ^= x << 8;
+        x ^= x << 16;
+        w[k] = level ? ~x : x;
+        level = w[k] >> 31;
+    }
+}
+
 // raw[s] is 4 words of slot s's ring. For S/PDIF they are the frame's left and right words, then the
 // next frame's, which only the key takes in. For I2S they are the frame before's L and R, then L and R,
 // of which the R before's LSB and L, R are sent. A slot that is off has zeros. adat is the frame's 8
-// words of ADAT line levels, MSB first, one bit per SMI word on SD8, or NULL.
+// words of the ADAT ring, whose 256 line levels go one per SMI word on SD8, or NULL.
 typedef struct {
     const uint32_t *raw[4];
     uint32_t type[4];
     uint32_t clocks;            // 1 puts BCK and LRCLK on the stream
     const uint32_t *adat;
-    const uint8_t (*msb8)[8];   // 8 bits, MSB first, to 8 bytes, for each byte value
     uint32_t *adat_key;         // the ADAT words each frame was made from, 8 a frame, used while adat is set
     uint32_t stride[4];         // bytes from one frame's raw words to the next frame's
     uint32_t stale;             // not 0: the keys do not describe dst, so every frame is written
@@ -173,11 +268,18 @@ static inline uint8x16x2_t smi_frame_cells(uint8x16_t n, uint32_t k, bool clocks
     return vzipq_u8(even, odd);
 }
 
-// lv is each slot's 128 levels (zeros for a slot that is off); adat and msb8 are as in the job.
-static inline void smi_frame_store(uint16_t *dst, const uint8x16_t lv[4], bool clocks, const uint32_t *adat,
-                                   const uint8_t msb8[256][8]) {
+// lv is each slot's 128 levels (zeros for a slot that is off); adat is as in the job.
+static inline void smi_frame_store(uint16_t *dst, const uint8x16_t lv[4], bool clocks, const uint32_t *adat) {
     uint8x16_t n4[4];
+    uint8_t level[256];     // ADAT's level in each SMI word
     smi_frame_nibbles(lv, n4);
+    if (adat) {
+        uint32_t w[8];
+        smi_adat_levels(adat, w);
+        for (uint32_t j = 0; j < 256u; j++) {
+            level[j] = (uint8_t)(w[j / 32u] >> (j % 32u) & 1u);
+        }
+    }
     for (uint32_t k = 0; k < 4u; k++, dst += 64) {
         uint8x16x2_t c = smi_frame_cells(n4[k], k, clocks);
         if (!adat) {
@@ -189,14 +291,13 @@ static inline void smi_frame_store(uint16_t *dst, const uint8x16_t lv[4], bool c
             }
         } else {
             for (uint32_t j = 0; j < 2u; j++) {
-                uint32_t bits = adat[2u * k + j];
                 uint8x16x2_t low = vzipq_u8(c.val[j], c.val[j]);
                 uint8x16x2_t out;
                 out.val[0] = low.val[0];
-                out.val[1] = vcombine_u8(vld1_u8(msb8[bits >> 24]), vld1_u8(msb8[(bits >> 16) & 0xFFu]));
+                out.val[1] = vld1q_u8(&level[64u * k + 32u * j]);
                 vst2q_u8((uint8_t *)&dst[32u * j], out);
                 out.val[0] = low.val[1];
-                out.val[1] = vcombine_u8(vld1_u8(msb8[(bits >> 8) & 0xFFu]), vld1_u8(msb8[bits & 0xFFu]));
+                out.val[1] = vld1q_u8(&level[64u * k + 32u * j + 16u]);
                 vst2q_u8((uint8_t *)&dst[32u * j + 16u], out);
             }
         }
@@ -224,7 +325,7 @@ static inline bool smi_frame_c(uint16_t *dst, const uint32_t *const raw[4], cons
                 : job->type[s] == SMI_SLOT_I2S ? smi_frame_levels_i2s(raw[s][2], raw[s][3], raw[s][1])
                                                : vdupq_n_u8(0);
     }
-    smi_frame_store(dst, lv, job->clocks != 0, job->adat, job->msb8);
+    smi_frame_store(dst, lv, job->clocks != 0, job->adat);
     return true;
 }
 

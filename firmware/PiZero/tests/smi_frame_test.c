@@ -7,6 +7,10 @@
 // same samples go through the old encoder, kept here, whose NRZI cells the reference turns into words,
 // and through smi_spdif_write, whose ring words the composer encodes. Both must give the same words.
 
+// ADAT is checked the same way (bring-up section 29). DSPi's encoder (adat_output.c), kept here, makes
+// the line-level words the ADAT ring held before, which the reference plays. smi_adat_write makes the
+// ring frames the composer now encodes. Both must give the same words and leave the same line level.
+
 // Build for QEMU, to any scratch path:
 //   arm-none-eabi-gcc -mcpu=cortex-a53 -mfpu=neon-fp-armv8 -mfloat-abi=hard -marm -O2 -I..
 //     --specs=rdimon.specs -Wl,-e,qemu_start -Wl,-Ttext-segment=0x40010000 -o smif.elf smi_frame_test.c
@@ -161,6 +165,62 @@ static void reference(uint16_t *dst, uint32_t in[4][4], const uint32_t type[4], 
     }
 }
 
+// DSPi's ADAT encoder, as in adat_output.c: 8 words of line levels a frame, w[0]'s MSB sent first.
+#define ADAT_SYNC_HEADER 0x8010u
+
+static uint16_t adat_token_lut[256], adat_hdr_nrzi[2];
+static uint32_t adat_hdr_exit[2], adat_silence_nrzi[2][8], adat_silence_exit[2];
+
+static uint32_t adat_encode_frame(uint32_t *w, const int32_t s24[8], uint32_t entry) {
+    uint32_t hdr = adat_hdr_nrzi[entry];
+    uint32_t m = (0u - adat_hdr_exit[entry]) & 0x3FFu;
+    uint32_t c[8];
+    for (int ch = 0; ch < 8; ch++) {
+        uint32_t s = (uint32_t)s24[ch];
+        uint32_t t2 = adat_token_lut[(s >> 16) & 0xFFu] ^ m;
+        m = (0u - (t2 & 1u)) & 0x3FFu;
+        uint32_t t1 = adat_token_lut[(s >> 8) & 0xFFu] ^ m;
+        m = (0u - (t1 & 1u)) & 0x3FFu;
+        uint32_t t0 = adat_token_lut[s & 0xFFu] ^ m;
+        m = (0u - (t0 & 1u)) & 0x3FFu;
+        c[ch] = (t2 << 20) | (t1 << 10) | t0;
+    }
+    w[0] = (hdr << 16) | (c[0] >> 14);
+    w[1] = (c[0] << 18) | (c[1] >> 12);
+    w[2] = (c[1] << 20) | (c[2] >> 10);
+    w[3] = (c[2] << 22) | (c[3] >> 8);
+    w[4] = (c[3] << 24) | (c[4] >> 6);
+    w[5] = (c[4] << 26) | (c[5] >> 4);
+    w[6] = (c[5] << 28) | (c[6] >> 2);
+    w[7] = (c[6] << 30) | c[7];
+    return m & 1u;
+}
+
+static void adat_encoder_init(void) {
+    for (uint32_t b = 0; b < 256; b++) {
+        uint32_t stuffed = 0x210u | ((b & 0xF0u) << 1) | (b & 0x0Fu);
+        uint32_t t = 0, l = 0;
+        for (int k = 9; k >= 0; k--) {
+            l ^= (stuffed >> k) & 1u;
+            t = (t << 1) | l;
+        }
+        adat_token_lut[b] = (uint16_t)t;
+    }
+    for (uint32_t lvl = 0; lvl < 2; lvl++) {
+        uint32_t t = 0, l = lvl;
+        for (int k = 15; k >= 0; k--) {
+            l ^= (ADAT_SYNC_HEADER >> k) & 1u;
+            t = (t << 1) | l;
+        }
+        adat_hdr_nrzi[lvl] = (uint16_t)t;
+        adat_hdr_exit[lvl] = l;
+    }
+    const int32_t zero[8] = {0};
+    for (uint32_t lvl = 0; lvl < 2; lvl++) {
+        adat_silence_exit[lvl] = adat_encode_frame(adat_silence_nrzi[lvl], zero, lvl);
+    }
+}
+
 static uint32_t rnd(void) {
     static uint32_t s = 0x12345678u;
     s ^= s << 13;
@@ -261,7 +321,7 @@ static uint32_t block_check(frames_fn fn, const char *name, const uint8_t status
         w += n;
         done += n;
     }
-    smi_frame_job_t job = {.raw = {zeros, zeros, zeros, zeros}, .msb8 = lut_msb8, .stale = 1};
+    smi_frame_job_t job = {.raw = {zeros, zeros, zeros, zeros}, .stale = 1};
     uint32_t type[4] = {0};
     job.raw[slot] = words;
     job.type[slot] = type[slot] = SMI_SLOT_SPDIF;
@@ -280,16 +340,65 @@ static uint32_t block_check(frames_fn fn, const char *name, const uint8_t status
     return bad != 0;
 }
 
+#define ADAT_ROW 192u   // DSPi's block rows
+
+// Runs of audio and silence through DSPi's encoder a frame at a time, as adat_output_push_block and
+// adat_write_silence did, and through smi_adat_write and smi_adat_silence. Every frame's levels must be
+// DSPi's words bit for bit (sent first is DSPi's MSB and bit 0 here), and the line level must agree.
+static uint32_t adat_check(void) {
+    static int32_t rows[8u * ADAT_ROW];
+    static uint32_t old[ADAT_ROW * 8u], ring[ADAT_ROW * 8u + 1u];
+    uint32_t bad = 0, old_level = rnd() & 1u, level = old_level;
+    for (uint32_t t = 0; t < 40u && !bad; t++) {
+        uint32_t n = t % 5u == 0 ? ADAT_ROW : 1u + rnd() % ADAT_ROW, shape = rnd() % 5u, first = rnd() % (ADAT_ROW - n + 1u);
+        bool silence = rnd() % 4u == 0;
+        for (uint32_t j = 0; j < 8u * ADAT_ROW; j++) {
+            // Sign-extended 24-bit samples, as DSPi's rows hold, or any word.
+            rows[j] = shape == 4u ? (int32_t)(rnd() << 8) >> 8 : (int32_t)shaped(shape);
+        }
+        ring[n * 8u] = 0xA5A5A5A5u;
+        if (silence) {
+            for (uint32_t i = 0; i < n; i++) {
+                memcpy(&old[8u * i], adat_silence_nrzi[old_level], 32);
+                old_level = adat_silence_exit[old_level];
+            }
+            smi_adat_silence(ring, n, level);
+        } else {
+            for (uint32_t i = 0; i < n; i++) {
+                int32_t s[8];
+                for (uint32_t c = 0; c < 8u; c++) {
+                    s[c] = rows[c * ADAT_ROW + first + i];
+                }
+                old_level = adat_encode_frame(&old[8u * i], s, old_level);
+            }
+            level = smi_adat_write(ring, rows + first, ADAT_ROW, n, level);
+        }
+        bad |= level != old_level || ring[n * 8u] != 0xA5A5A5A5u;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t w[8];
+            smi_adat_levels(&ring[8u * i], w);
+            for (uint32_t k = 0; k < 8u; k++) {
+                bad |= w[k] != rbit32(old[8u * i + k]);
+            }
+        }
+        if (bad) {
+            printf("adat: run of %u frames, %s, differs from DSPi's encoder\n", (unsigned)n, silence ? "silence" : "audio");
+        }
+    }
+    return bad != 0;
+}
+
 int main(void) {
     static const uint32_t zeros[4];
     tables_init();
     spdif_lookup_init();
+    adat_encoder_init();
     uint32_t fails = 0, runs = 0;
     for (uint32_t t = 0; t < 81u * 4u * 100u; t++) {
-        smi_frame_job_t job = {.clocks = (t / 81u) & 1u, .msb8 = lut_msb8};
+        smi_frame_job_t job = {.clocks = (t / 81u) & 1u};
         // Each slot's ring words, with room for the 4 the key reads at the last frame. cells holds the
-        // same S/PDIF frames as the old encoder wrote them.
-        uint32_t buf[4][RUN * 4u], cells[4][8u * 4u], adat[RUN * 8u];
+        // same S/PDIF frames as the old encoder wrote them, and adat_old the ADAT frames as DSPi's did.
+        uint32_t buf[4][RUN * 4u], cells[4][8u * 4u], adat[RUN * 8u], adat_old[RUN * 8u];
         uint32_t c = t % 81u, shape = rnd() % 4u, n = 1u + rnd() % RUN;
         for (uint32_t s = 0; s < 4u; s++, c /= 3u) {
             job.type[s] = c % 3u;
@@ -312,9 +421,36 @@ int main(void) {
                 smi_spdif_write(buf[s], 8u, idle, w, silence ? NULL : lr, RUN);
             }
         }
-        for (uint32_t j = 0; j < RUN * 8u; j++) {
-            adat[j] = rnd();
+        // ADAT frames from a random line level, as audio, as silence, or as one after the other.
+        int32_t rows[8u * RUN];
+        uint32_t old_level = rnd() & 1u, level = old_level, quiet = rnd() % 4u, split = quiet == 0 ? rnd() % RUN : 0;
+        for (uint32_t j = 0; j < 8u * RUN; j++) {
+            rows[j] = (int32_t)shaped(shape);
         }
+        for (uint32_t k = 0; k < RUN; k++) {
+            if (quiet == 1u || (quiet == 0 && k < split)) {
+                memcpy(&adat_old[8u * k], adat_silence_nrzi[old_level], 32);
+                old_level = adat_silence_exit[old_level];
+                smi_adat_silence(&adat[8u * k], 1, level);
+            } else {
+                int32_t smp[8];
+                for (uint32_t ch = 0; ch < 8u; ch++) {
+                    smp[ch] = rows[ch * RUN + k];
+                }
+                old_level = adat_encode_frame(&adat_old[8u * k], smp, old_level);
+                uint32_t run = quiet == 0 ? RUN - k : 1u;   // the rest in one call, or a frame at a time
+                level = smi_adat_write(&adat[8u * k], rows + k, RUN, run, level);
+                if (run > 1u) {
+                    for (k++; k < RUN; k++) {
+                        for (uint32_t ch = 0; ch < 8u; ch++) {
+                            smp[ch] = rows[ch * RUN + k];
+                        }
+                        old_level = adat_encode_frame(&adat_old[8u * k], smp, old_level);
+                    }
+                }
+            }
+        }
+        fails += level != old_level;
         job.adat = (t / 162u) & 1u ? adat : NULL;
         static uint16_t want[RUN * 256];
         for (uint32_t k = 0; k < n; k++) {
@@ -325,7 +461,7 @@ int main(void) {
                     memcpy(in[s], &cells[s][4u * k], 16);
                 }
             }
-            reference(&want[k * 256u], in, job.type, job.clocks, job.adat ? &adat[8u * k] : NULL);
+            reference(&want[k * 256u], in, job.type, job.clocks, job.adat ? &adat_old[8u * k] : NULL);
         }
         fails += check(smi_frames_c, "smi_frames_c", &job, n, want);
 #ifdef __arm__
@@ -336,6 +472,9 @@ int main(void) {
                 buf[s][j] = shaped(rnd() % 4u);
             }
         }
+        for (uint32_t j = 0; j < RUN * 8u; j++) {
+            adat[j] = shaped(rnd() % 4u);
+        }
         uint32_t key[RUN * SMI_FRAME_KEY_WORDS], akey[RUN * SMI_FRAME_ADAT_WORDS];
         smi_frame_job_t any = job;
         any.adat_key = akey;
@@ -344,6 +483,9 @@ int main(void) {
         fails += check(smi_frames_a32, "smi_frames_a32 on any words", &job, n, want);
 #endif
         runs += n;
+    }
+    for (uint32_t t = 0; t < 200u; t++) {
+        fails += adat_check();
     }
     for (uint32_t t = 0; t < 200u; t++) {
         uint8_t status[5];
