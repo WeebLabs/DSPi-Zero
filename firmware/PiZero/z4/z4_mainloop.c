@@ -1,7 +1,7 @@
 // Port of the parts of DSPi's main.c that keep the pipeline and its configuration running: start-up,
 // the muted pipeline reset, rate changes and the deferred work behind vendor SET requests. main.c
 // itself is not compiled (it owns main() and the RP2350 hardware), so its handlers are carried over
-// here calling the same DSPi functions, minus the input receivers, Core 1 and PIO output hardware.
+// here calling the same DSPi functions, minus Core 1 and the RP2350's PIO and DMA hardware.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -28,6 +28,7 @@
 #include "flash_storage.h"
 #include "i2c_control.h"
 #include "i2s_input.h"
+#include "i2s_input_pi.h"
 #include "input_source_names.h"
 #include "leveller.h"
 #include "lg_sound_sync.h"
@@ -92,8 +93,7 @@ static void pipeline_fade_reset(void) {
     fade_start_us = 0;
 }
 
-// Public in main.c (Control Surfaces' input level noun reads it). The receivers never lock here, so
-// only USB and the test-signal generator can be live producers.
+// Public in main.c (Control Surfaces' input level noun reads it).
 bool pipeline_producer_is_streaming(void) {
     if (active_input_source == INPUT_SOURCE_USB && sync_started) {
         return true;
@@ -158,6 +158,8 @@ static void pipeline_settle_to_silence(void) {
     }
 }
 
+static bool i2s_prefilling;     // main.c's: the outputs are down while the I2S input fills the rings
+
 static void prepare_pipeline_reset(uint32_t mute_samples) {
     pipeline_settle_to_silence();
     uint32_t fs = audio_state.freq ? audio_state.freq : 48000u;
@@ -167,6 +169,7 @@ static void prepare_pipeline_reset(uint32_t mute_samples) {
     }
     preset_mute_counter = mute_samples;
     preset_loading = true;
+    i2s_prefilling = false;     // the handshake starts again from preset_loading once this operation ends
     __dmb();
     pipeline_clear_soft_mute_request();
     pipeline_fade_reset();
@@ -311,7 +314,89 @@ static void service_spdif_input(void) {
     spdif_input_update_clock_servo();
 }
 
-// main.c's flash write bracket. The receivers are stand-ins, so there is nothing to suspend.
+// main.c's role election: the input is the clock master only when no output slot is I2S, and never
+// with an external master (i2s_input_start() works that role out itself).
+static bool i2s_input_should_be_master(void) {
+    if (i2s_clock_mode == I2S_CLOCK_MODE_SLAVE) {
+        return false;
+    }
+    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+        if (output_types[i] == OUTPUT_TYPE_I2S) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// main.c's I2S part of input_service_handshakes(). With an external master the flow is S/PDIF's, gated
+// on lock, plus the Pi's own clock follower: the outputs only start once the SMI's clocks follow the
+// master's. Otherwise the same prefill without a lock, which in the slave role is silence, since the
+// drain stops the output clocks that clock the input.
+static uint32_t i2s_prefill_drains, i2s_prefill_starts;
+
+void z4_i2s_prefill_counts(uint32_t *drains, uint32_t *starts) {
+    *drains = i2s_prefill_drains;
+    *starts = i2s_prefill_starts;
+}
+
+static void service_i2s_input(void) {
+    if (active_input_source != INPUT_SOURCE_I2S) {
+        i2s_prefilling = false;
+        return;
+    }
+    if (i2s_clock_mode == I2S_CLOCK_MODE_SLAVE) {
+        i2s_slave_poll();
+        I2sSlaveState sl_state = i2s_slave_get_state();
+        bool locked = sl_state == I2S_SLAVE_LOCKED && i2s_input_pi_follower_locked();
+        if (sl_state == I2S_SLAVE_LOCKED && preset_loading && !i2s_prefilling && dac_hw_mute_hold_elapsed()) {
+            // The rate first: the follower can only lock once the pipeline runs at the master's rate.
+            if (!i2s_slave_check_rate_change() && locked) {
+                drain_and_disable_outputs();
+                preset_loading = false;
+                preset_mute_counter = 0;
+                i2s_prefilling = true;
+                i2s_input_discard_queued();
+                i2s_prefill_drains++;
+            }
+        }
+        if (i2s_prefilling && locked && slot_fill_at_target(0)) {
+            enable_outputs_in_sync();
+            i2s_prefilling = false;
+            dac_hw_mute_release();
+            i2s_prefill_starts++;
+        }
+        if (sl_state == I2S_SLAVE_RELOCKING) {
+            if (!preset_loading) {
+                prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+                pipeline_reset_cpu_metering();
+            }
+            i2s_input_stop();
+            i2s_input_start(i2s_input_should_be_master());
+        }
+        i2s_slave_update_clock_servo();
+        return;
+    }
+    if (preset_loading && !i2s_prefilling && dac_hw_mute_hold_elapsed()) {
+        drain_and_disable_outputs();
+        preset_loading = false;
+        preset_mute_counter = 0;
+        i2s_prefilling = true;
+        i2s_input_discard_queued();
+        i2s_prefill_drains++;
+    }
+    if (i2s_prefilling && slot_fill_at_target(0)) {
+        enable_outputs_in_sync();
+        i2s_prefilling = false;
+        dac_hw_mute_release();
+        i2s_prefill_starts++;
+    } else if (i2s_prefilling && !i2s_input_is_clock_master()) {
+        i2s_input_prefill_silence(output_ring_block_cap);
+    }
+}
+
+// main.c's flash write bracket. Flash is RAM here, so only the I2S input is suspended, as main.c does.
+static bool i2s_suspended_for_flash;
+
 static void prepare_flash_write_operation(void) {
     z4_service_producer();
     prepare_pipeline_reset(samples_for_duration_ms(audio_state.freq, FLASH_WRITE_PREMUTE_MS));
@@ -321,10 +406,24 @@ static void prepare_flash_write_operation(void) {
             z4_service_producer();
         }
     }
+    if (active_input_source == INPUT_SOURCE_I2S && i2s_input_get_state() != I2S_INPUT_INACTIVE) {
+        i2s_input_stop();
+        i2s_suspended_for_flash = true;
+    }
     output_rings_stamp_silence_ahead();
 }
 
+static void complete_flash_write_resume_inputs(void) {
+    if (i2s_suspended_for_flash) {
+        i2s_suspended_for_flash = false;
+        if (active_input_source == INPUT_SOURCE_I2S && !input_source_change_pending) {
+            i2s_input_start(i2s_input_should_be_master());
+        }
+    }
+}
+
 static void complete_flash_write_operation_full(void) {
+    complete_flash_write_resume_inputs();
     if (input_source_is_spdif(active_input_source)) {
         reset_usb_feedback_loop();
         return;
@@ -393,6 +492,11 @@ static bool process_type_switches(uint8_t change_mask, const uint8_t new_types[]
     output_type_switch_in_progress = true;
     __dmb();
     prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+    // The I2S input's role follows the output types, so it restarts once they are in place.
+    bool i2s_rx_was_running = active_input_source == INPUT_SOURCE_I2S && i2s_input_get_state() != I2S_INPUT_INACTIVE;
+    if (i2s_rx_was_running) {
+        i2s_input_stop();
+    }
     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
         bool had_i2s = current_types[i] == OUTPUT_TYPE_I2S;
         bool want_i2s = target_types[i] == OUTPUT_TYPE_I2S;
@@ -453,6 +557,9 @@ static bool process_type_switches(uint8_t change_mask, const uint8_t new_types[]
     complete_pipeline_reset();
     output_type_switch_in_progress = false;
     __dmb();
+    if (i2s_rx_was_running && active_input_source == INPUT_SOURCE_I2S && !input_source_change_pending) {
+        i2s_input_start(i2s_input_should_be_master());
+    }
     return true;
 }
 
@@ -523,7 +630,8 @@ static void apply_nominal_output_rate(uint32_t rate) {
     }
 }
 
-static void perform_rate_change(uint32_t new_freq) {
+// With defer_output_to_input_prefill the outputs stay down for the I2S prefill, which restarts them.
+static void perform_rate_change(uint32_t new_freq, bool defer_output_to_input_prefill) {
     switch (new_freq) {
     case 44100:
     case 48000:
@@ -533,6 +641,10 @@ static void perform_rate_change(uint32_t new_freq) {
         new_freq = 44100;
     }
     prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+    bool i2s_input_was_running = active_input_source == INPUT_SOURCE_I2S && i2s_input_get_state() != I2S_INPUT_INACTIVE;
+    if (i2s_input_was_running) {
+        i2s_input_stop();
+    }
     output_rate_hz = new_freq;
     output_latency_apply(new_freq, active_input_source);
     audio_state.freq = new_freq;
@@ -559,13 +671,32 @@ static void perform_rate_change(uint32_t new_freq) {
     adat_input_on_rate_change(new_freq);
     audio_i2s_update_all_frequencies(new_freq);
     apply_nominal_output_rate(new_freq);
-    complete_pipeline_reset();
+    if (!defer_output_to_input_prefill) {
+        complete_pipeline_reset();
+    }
+    if (i2s_input_was_running && active_input_source == INPUT_SOURCE_I2S) {
+        i2s_input_start(i2s_input_should_be_master());
+    }
+}
+
+// main.c's i2s_input_bringup_prefill(): the rate and MCK, then the input, with the outputs left muted for
+// the I2S prefill. The caller has engaged the mute and made I2S the source.
+static void i2s_input_bringup_prefill(void) {
+    bool master = i2s_input_should_be_master();
+    if (i2s_clock_mode != I2S_CLOCK_MODE_SLAVE && i2s_input_rate != audio_state.freq) {
+        perform_rate_change(i2s_input_rate, true);
+    }
+    if (i2s_mck_enabled && master) {
+        audio_i2s_mck_update_frequency(i2s_input_rate, i2s_mck_multiplier);
+        audio_i2s_mck_set_enabled(true);
+    }
+    i2s_input_start(master);
 }
 
 void z4_stream_restart(void) {
     uint32_t rate = z4_host_rate();
     if (active_input_source == INPUT_SOURCE_USB && audio_state.freq != rate) {
-        perform_rate_change(rate);
+        perform_rate_change(rate, false);
     } else {
         prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
         complete_pipeline_reset();
@@ -996,6 +1127,32 @@ static void service_dac_hw_mute(void) {
 // ---------------------------------------------------------------------------------------------------
 // Presets, factory reset, output config and bulk parameters (main.c order)
 
+// main.c stops a live I2S input across these, since they may change the output types (and so its role),
+// its channel count or its rate, and restarts it once afterwards. The restart already uses the new
+// configuration, so it consumes the deferred restart requests too.
+static bool i2s_suspend(void) {
+    if (active_input_source == INPUT_SOURCE_I2S && i2s_input_get_state() != I2S_INPUT_INACTIVE) {
+        i2s_input_stop();
+        return true;
+    }
+    return false;
+}
+
+static void i2s_resume(bool suspended, bool check_rate) {
+    if (!suspended || active_input_source != INPUT_SOURCE_I2S || input_source_change_pending) {
+        return;
+    }
+    i2s_input_start(i2s_input_should_be_master());
+    i2s_rx_pin_change_pending = false;
+    i2s_input_restart_pending = false;
+    uint8_t mode = i2s_clock_mode_change_pending ? pending_i2s_clock_mode : i2s_clock_mode;
+    if (check_rate && mode != I2S_CLOCK_MODE_SLAVE && i2s_input_rate != audio_state.freq) {
+        pending_rate = i2s_input_rate;
+        __dmb();
+        rate_change_pending = true;
+    }
+}
+
 static void service_presets(void) {
     if (preset_load_pending && pipeline_reset_ready()) {
         preset_load_pending = false;
@@ -1005,6 +1162,7 @@ static void service_presets(void) {
         uint8_t old_types[NUM_SPDIF_INSTANCES];
         memcpy(old_types, output_types, NUM_SPDIF_INSTANCES);
         prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+        bool suspended_i2s = i2s_suspend();
         preset_load(pending_preset_load_slot);
         if (!apply_restored_outputs(old_types)) {
             if (input_source_is_spdif(active_input_source)) {
@@ -1013,8 +1171,7 @@ static void service_presets(void) {
                 complete_pipeline_reset();
             }
         }
-        i2s_rx_pin_change_pending = false;
-        i2s_input_restart_pending = false;
+        i2s_resume(suspended_i2s, true);
     }
     if (save_params_pending) {
         save_params_pending = false;
@@ -1043,7 +1200,9 @@ static void service_presets(void) {
                 preset_delete(slot);
             }
         }
-        if (!apply_restored_outputs(old_types)) {
+        if (apply_restored_outputs(old_types)) {
+            complete_flash_write_resume_inputs();
+        } else {
             complete_flash_write_operation_full();
         }
     }
@@ -1055,6 +1214,7 @@ static void service_presets(void) {
         uint8_t old_types[NUM_SPDIF_INSTANCES];
         memcpy(old_types, output_types, NUM_SPDIF_INSTANCES);
         prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+        bool suspended_i2s = i2s_suspend();
         flash_factory_reset();
         dsp_recalculate_all_filters((float)audio_state.freq);
         dsp_update_delay_samples((float)audio_state.freq);
@@ -1066,8 +1226,7 @@ static void service_presets(void) {
         if (!apply_restored_outputs(old_types)) {
             complete_pipeline_reset();
         }
-        i2s_rx_pin_change_pending = false;
-        i2s_input_restart_pending = false;
+        i2s_resume(suspended_i2s, false);
     }
 }
 
@@ -1095,6 +1254,7 @@ static void service_outputs_and_bulk(void) {
         uint8_t old_types[NUM_SPDIF_INSTANCES];
         memcpy(old_types, output_types, NUM_SPDIF_INSTANCES);
         prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+        bool suspended_i2s = i2s_suspend();
         uint16_t occ;
         uint8_t startup_mode, default_slot, last_active, oc_mode, mv_mode;
         preset_get_directory(&occ, &startup_mode, &default_slot, &last_active, &oc_mode, &mv_mode);
@@ -1113,26 +1273,42 @@ static void service_outputs_and_bulk(void) {
                 }
             }
         }
-        i2s_rx_pin_change_pending = false;
-        i2s_input_restart_pending = false;
+        i2s_resume(suspended_i2s, true);
     }
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Input configuration. The receivers are stand-ins (dspi_standins.c): a selected S/PDIF or ADAT
-// input waits for lock forever and I2S stays inactive, so only USB and the generator produce audio.
+// Input configuration. The ADAT receiver is a stand-in (dspi_standins.c) that waits for lock forever.
 
 static void service_input_config(void) {
+    // An I2S clock mode change only needs work while I2S is the source: the input restarts in its new
+    // role and the I2S output slots are rebuilt with the clocking that goes with it.
     if (i2s_clock_mode_change_pending) {
-        i2s_clock_mode_change_pending = false;
-        __dmb();
-        if (i2s_clock_mode != pending_i2s_clock_mode) {
-            bool live = active_input_source == INPUT_SOURCE_I2S;
-            i2s_clock_mode = pending_i2s_clock_mode;
-            if (live) {
-                rebuild_i2s_output_clocking();
+        if (active_input_source != INPUT_SOURCE_I2S || pending_i2s_clock_mode == i2s_clock_mode) {
+            i2s_clock_mode_change_pending = false;
+            __dmb();
+            if (i2s_clock_mode != pending_i2s_clock_mode) {
+                i2s_clock_mode = pending_i2s_clock_mode;
+                apply_mck_policy();
+                uint8_t wire_mode = i2s_clock_mode;
+                notify_param_write(offsetof(WireBulkParams, input_config.i2s_clock_mode), 1, &wire_mode);
             }
+        } else if (pipeline_reset_ready()) {
+            i2s_clock_mode_change_pending = false;
+            __dmb();
+            prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+            if (i2s_input_get_state() != I2S_INPUT_INACTIVE) {
+                i2s_input_stop();
+            }
+            i2s_clock_mode = pending_i2s_clock_mode;
+            rebuild_i2s_output_clocking();
             apply_mck_policy();
+            if (i2s_clock_mode == I2S_CLOCK_MODE_SLAVE) {
+                rate_change_pending = false;    // the external master sets the rate once locked
+            } else if (i2s_input_rate != audio_state.freq) {
+                perform_rate_change(i2s_input_rate, true);
+            }
+            i2s_input_start(i2s_input_should_be_master());
             uint8_t wire_mode = i2s_clock_mode;
             notify_param_write(offsetof(WireBulkParams, input_config.i2s_clock_mode), 1, &wire_mode);
         }
@@ -1162,6 +1338,10 @@ static void service_input_config(void) {
                 spdif_input_stop();
             } else if (old_source == INPUT_SOURCE_I2S) {
                 i2s_input_stop();
+                // MCK ran for the input alone when no output slot is I2S, so it stops with it.
+                if (i2s_mck_enabled && i2s_input_should_be_master()) {
+                    audio_i2s_mck_set_enabled(false);
+                }
             } else if (old_source == INPUT_SOURCE_ADAT) {
                 adat_input_stop();
             }
@@ -1195,14 +1375,10 @@ static void service_input_config(void) {
             if (input_source_is_spdif(new_source)) {
                 spdif_input_start();
             } else if (new_source == INPUT_SOURCE_I2S) {
-                if (i2s_clock_mode != I2S_CLOCK_MODE_SLAVE && i2s_input_rate != audio_state.freq) {
-                    perform_rate_change(i2s_input_rate);
-                }
-                apply_mck_policy();     // main.c's i2s_input_bringup_prefill() starts MCK for a master input
-                i2s_input_start(true);
+                i2s_input_bringup_prefill();
             } else if (new_source == INPUT_SOURCE_ADAT) {
                 if (adat_clock_mode == ADAT_CLOCK_MODE_MASTER && i2s_input_rate != audio_state.freq) {
-                    perform_rate_change(i2s_input_rate);
+                    perform_rate_change(i2s_input_rate, false);   // the stand-in never prefills
                 }
                 adat_input_start();
             } else {
@@ -1220,11 +1396,19 @@ static void service_input_config(void) {
         }
     }
 
-    // Receiver pin moves and restarts: nothing is running to move.
+    // Receiver pins stay where the Pi has them, but a changed I2S channel count needs a restart, which
+    // main.c also makes for a moved pin.
     spdif_rx_pin_change_pending = false;
     adat_input_restart_pending = false;
-    i2s_rx_pin_change_pending = false;
-    i2s_input_restart_pending = false;
+    if ((i2s_rx_pin_change_pending || i2s_input_restart_pending) && pipeline_reset_ready()) {
+        i2s_rx_pin_change_pending = false;
+        i2s_input_restart_pending = false;
+        if (active_input_source == INPUT_SOURCE_I2S && i2s_input_get_state() != I2S_INPUT_INACTIVE) {
+            prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+            i2s_input_stop();
+            i2s_input_start(i2s_input_should_be_master());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1238,6 +1422,7 @@ void z4_dspi_service(void) {
 
     dac_hw_mute_tick();
     service_spdif_input();
+    service_i2s_input();
     lg_sound_sync_tick();
     siggen_service();
     rta_service();
@@ -1258,7 +1443,8 @@ void z4_dspi_service(void) {
             r = z4_host_rate();
         }
         if (r != audio_state.freq) {
-            perform_rate_change(r);
+            // For an I2S input the prefill restarts the outputs and releases the mute, as in main.c.
+            perform_rate_change(r, active_input_source == INPUT_SOURCE_I2S);
         }
     }
 
@@ -1327,6 +1513,9 @@ void z4_dspi_init(void) {
     if (input_source_is_spdif(active_input_source)) {
         prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
         spdif_input_start();
+    } else if (active_input_source == INPUT_SOURCE_I2S) {
+        prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+        i2s_input_bringup_prefill();
     } else if (active_input_source == INPUT_SOURCE_ADAT) {
         prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
         adat_input_start();
@@ -1347,6 +1536,6 @@ void z4_dspi_init(void) {
     // clock's rate instead (48 kHz until the host sets it).
     rate_change_pending = false;
     if (active_input_source == INPUT_SOURCE_USB && audio_state.freq != z4_host_rate()) {
-        perform_rate_change(z4_host_rate());
+        perform_rate_change(z4_host_rate(), false);
     }
 }

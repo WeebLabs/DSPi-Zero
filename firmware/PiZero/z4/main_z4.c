@@ -37,6 +37,8 @@
 #include "pdm_generator.h"
 #include "siggen.h"
 #include "spdif_input.h"
+#include "dac_hw_mute.h"
+#include "i2s_input.h"
 #include "usb_audio.h"
 
 #include "z4.h"
@@ -45,6 +47,7 @@
 #include "pcm_out.h"
 #include "smi_out.h"
 #include "pcm_rx.h"
+#include "i2s_input_pi.h"
 #include "spdif_rx_pi.h"
 #include "cpu_meter.h"
 #include "clk_dump.h"
@@ -585,7 +588,7 @@ static void sensors_refresh(void) {
     static uint32_t last_us;
     static bool primed;
     uint32_t now = board_micros();
-    if (primed && now - last_us < 1000000u) {
+    if ((primed && now - last_us < 1000000u) || i2s_input_pi_running()) {
         return;
     }
     primed = true;
@@ -700,6 +703,38 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         }
         pcm_rx_request(req->wValue);
         return tud_control_status(rhport, req);
+    }
+    // 0x51: the I2S receiver (i2s_input_pi.h). IN returns its status, or with wValue k + 1 the snapshots
+    // around its k-th bad half; OUT sets the bench overrides (i2s_input_pi_bench_t), or with no data
+    // puts the defaults back.
+    if (bench && req->bRequest == 0x51) {
+        static i2s_input_pi_bench_t pb;
+        static i2s_input_pi_status_t ps;
+        if (in) {
+            if (stage != CONTROL_STAGE_SETUP) {
+                return true;
+            }
+            if (req->wValue) {
+                return tud_control_xfer(rhport, req, (void *)(uintptr_t)i2s_input_pi_dump(req->wValue - 1u),
+                                        req->wLength < 4096u ? req->wLength : 4096u);
+            }
+            i2s_input_pi_status(&ps);
+            z4_i2s_prefill_counts(&ps.prefill_drains, &ps.prefill_starts);
+            ps.dac_muted = dac_hw_mute_is_asserted();
+            return tud_control_xfer(rhport, req, &ps, req->wLength < sizeof(ps) ? req->wLength : sizeof(ps));
+        }
+        if (stage == CONTROL_STAGE_SETUP) {
+            if (req->wLength == 0u) {
+                i2s_input_pi_bench(NULL);
+                return tud_control_status(rhport, req);
+            }
+            memset(&pb, 0, sizeof(pb));
+            return tud_control_xfer(rhport, req, &pb, req->wLength < sizeof(pb) ? req->wLength : sizeof(pb));
+        }
+        if (stage == CONTROL_STAGE_DATA) {
+            i2s_input_pi_bench(&pb);
+        }
+        return true;
     }
     // 0x46: PLLA (PiZero_PLLA_plan.md phase 1). OUT wValue 1 retunes to row wIndex, 2 drives the unused
     // PCM clock from source wIndex >> 12 with integer divider wIndex & 0xFFF, 3 starts the frequency
@@ -1178,7 +1213,9 @@ void tud_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr) {
     uh.queued[uh_kind(eventid)]++;
 }
 
-void z4_service_producer(void) {
+// main.c's pipeline_service_producer(): in the main loop (lock_gated) an external-clock I2S input delivers
+// only while LOCKED, since before that it runs at a foreign rate; the settle loops take whatever comes.
+static void service_producer(bool lock_gated) {
     static uint32_t last;
     uint32_t now = board_micros();
     uint32_t gap = now - last;
@@ -1197,12 +1234,23 @@ void z4_service_producer(void) {
     input_delivery_mark();
     if (input_source_is_spdif(active_input_source)) {
         spdif_input_poll();
+    } else if (active_input_source == INPUT_SOURCE_I2S) {
+        // The follower's lock as well: blocks delivered before it would run preset_loading out, and
+        // the prefill handshake that starts the outputs and releases the DAC mute waits on both.
+        if (!lock_gated || i2s_clock_mode != I2S_CLOCK_MODE_SLAVE ||
+            (i2s_slave_get_state() == I2S_SLAVE_LOCKED && i2s_input_pi_follower_locked())) {
+            i2s_input_poll();
+        }
     }
     siggen_pump();
     output_rings_idle_pump();
     notify_drain(0);
     cpu_meter_leave(CPU_METER_PRODUCER);
     cpu_meter_publish();    // after any block, whose own load figure DSPi has just written
+}
+
+void z4_service_producer(void) {
+    service_producer(false);
 }
 
 bool z4_stream_running(void) {
@@ -1271,6 +1319,7 @@ int main(void) {
         sensors_refresh();
         pll_out_poll();
         pcm_rx_poll();
+        i2s_input_pi_poll();
         if (pll_out_watchdog() == PLL_WD_FALLBACK) {
             smi_out_set_source(SMI_SRC_PLLD);   // PLLA keeps being rewritten: stay on PLLD until reboot
         }
@@ -1285,7 +1334,7 @@ int main(void) {
             smi_out_set_source(smi_source_request);
             smi_source_request = 0xFFFFFFFFu;
         }
-        z4_service_producer();
+        service_producer(true);
         cpu_meter_enter();
         z4_dspi_service();
         cpu_meter_leave(CPU_METER_SERVICES);

@@ -31,7 +31,9 @@
 #include "mbox.h"
 #include "smi_out.h"
 #include "adat_output.h"
+#include "i2s_input.h"
 #include "uart.h"
+#include "../z4/i2s_input_pi.h"
 
 // After the Pi's uart.h: this one renames the SDK's uart_init.
 #include "hardware/uart.h"
@@ -249,7 +251,7 @@ void dma_start_channel_mask(uint32_t chan_mask) {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// PIO: register stand-ins, no state machines
+// PIO: register stand-ins, no state machines. DSPi's I2S receiver on pio2 is z4/i2s_input_pi.c.
 
 pio_hw_t pico_shim_pio_hw[3];
 static uint8_t pio_sm_claimed[3];
@@ -294,6 +296,9 @@ void pio_set_sm_mask_enabled(PIO pio, uint32_t mask, bool enabled) {
 }
 void pio_enable_sm_mask_in_sync(PIO pio, uint32_t mask) {
     pio->ctrl |= mask & 0xfu;
+    if (PIO_NUM(pio) == 2u && (mask & 0xfu)) {
+        i2s_input_pi_enable();
+    }
 }
 void pio_sm_restart(PIO pio, uint sm) {
     (void)pio, (void)sm;
@@ -340,6 +345,9 @@ void pio_sm_claim(PIO pio, uint sm) {
 }
 void pio_sm_unclaim(PIO pio, uint sm) {
     pio_sm_claimed[PIO_NUM(pio)] &= (uint8_t)~(1u << sm);
+    if (PIO_NUM(pio) == 2u && pio_sm_claimed[2] == 0u) {
+        i2s_input_pi_release();
+    }
 }
 bool pio_sm_is_claimed(PIO pio, uint sm) {
     return (pio_sm_claimed[PIO_NUM(pio)] >> sm) & 1u;
@@ -383,12 +391,14 @@ uint pio_sm_get_tx_fifo_level(PIO pio, uint sm) {
     (void)pio, (void)sm;
     return 0;
 }
+// PIO IRQ 7 on pio2 is the I2S receiver's framing slip (i2s_input.c's I2S_RX_SLIP_IRQ).
 bool pio_interrupt_get(PIO pio, uint pio_interrupt_num) {
-    (void)pio, (void)pio_interrupt_num;
-    return false;
+    return PIO_NUM(pio) == 2u && pio_interrupt_num == 7u && i2s_input_pi_slipped();
 }
 void pio_interrupt_clear(PIO pio, uint pio_interrupt_num) {
-    (void)pio, (void)pio_interrupt_num;
+    if (PIO_NUM(pio) == 2u && pio_interrupt_num == 7u) {
+        i2s_input_pi_clear_slip();
+    }
 }
 int pio_set_gpio_base(PIO pio, uint gpio_base) {
     (void)pio, (void)gpio_base;
@@ -1365,6 +1375,8 @@ static uint32_t smi_compose(uint32_t frame, uint16_t *dst, uint32_t ring_idx, ui
     comp_slot_t found[2u * SMI_SLOTS];
     bool any_i2s;
     uint32_t nf = smi_gather(found, &any_i2s);
+    // BCK and LRCLK also run for the I2S input: as its clock master, or to be locked to an external one.
+    any_i2s |= i2s_input_is_clock_master() || i2s_input_pi_owns_pll();
     const uint32_t *ring[SMI_SLOTS];
     uint32_t offset[SMI_SLOTS], wrap[SMI_SLOTS][4];
     bool adat = adat_on;

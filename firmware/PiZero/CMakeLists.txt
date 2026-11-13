@@ -233,6 +233,7 @@ if(PIZERO_BOARD STREQUAL "zero2")
         pdm_generator.c
         audio_input.c
         spdif_input.c
+        i2s_input.c
         input_servo.c
         notify.c
         bg_job.c
@@ -263,6 +264,25 @@ if(PIZERO_BOARD STREQUAL "zero2")
         VERBATIM)
     add_dependencies(dspi_z4 dspi_z4_build_info)
     target_include_directories(dspi_z4 PRIVATE ${Z4_GENERATED_DIR})
+    # i2s_input.c includes its PIO programs as pioasm builds them, from DSPi's own pico-sdk. Only the
+    # program sizes and entry points matter here: i2s_input_pi.c receives in their place.
+    include(ExternalProject)
+    ExternalProject_Add(z4_pioasm
+        SOURCE_DIR ${DSPI_DIR}/../pico-sdk/tools/pioasm
+        BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/z4_pioasm
+        CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release "-DPIOASM_VERSION_STRING=2.1.1"
+        BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/z4_pioasm/pioasm
+        INSTALL_COMMAND "")
+    add_custom_command(OUTPUT ${Z4_GENERATED_DIR}/i2s_input.pio.h
+        COMMAND ${CMAKE_CURRENT_BINARY_DIR}/z4_pioasm/pioasm -o c-sdk ${DSPI_DIR}/i2s_input.pio
+            ${Z4_GENERATED_DIR}/i2s_input.pio.h
+        DEPENDS z4_pioasm ${DSPI_DIR}/i2s_input.pio
+        VERBATIM)
+    add_custom_target(z4_pio_headers DEPENDS ${Z4_GENERATED_DIR}/i2s_input.pio.h)
+    add_dependencies(dspi_z4 z4_pio_headers)
+    # DSPi's RP2350 receiver block and its DMA interrupt, as its own CMakeLists.txt sets them.
+    set_property(SOURCE ${DSPI_DIR}/i2s_input.c APPEND PROPERTY COMPILE_DEFINITIONS
+        PICO_SPDIF_RX_PIO=2 PICO_SPDIF_RX_DMA_IRQ=1)
     # uac2 first for its tusb_config.h, then the shim, then DSPi and the real pico-extras output headers.
     target_include_directories(dspi_z4 BEFORE PUBLIC ${CMAKE_CURRENT_LIST_DIR}/uac2 ${CMAKE_CURRENT_LIST_DIR}/pico_shim)
     target_include_directories(dspi_z4 PUBLIC
@@ -317,11 +337,12 @@ if(PIZERO_BOARD STREQUAL "zero2")
         tud_descriptor_string_cb=dspi_tud_descriptor_string_cb
     )
 
-    add_executable(pizero_z4 ${PLATFORM_SRC} irq.c mem_ops.c pcm_out.c pcm_rx.c pll_out.c smi_out.c z4/main_z4.c z4/clk_dump.c z4/z4_prof.c z4/z4_mainloop.c z4/z4_globals.c z4/dspi_standins.c z4/spdif_rx_pi.c z4/adat_output_pi.c z4/soft_vcxo_pi.c z4/cpu_meter.c spdif_decode.c spdif_decode_a32.S smi_frame_a32.S pico_shim/pico_shim.c uac2/usb_descriptors.c)
+    add_executable(pizero_z4 ${PLATFORM_SRC} irq.c mem_ops.c pcm_out.c pcm_rx.c i2s_rx_decode.c i2s_rx_decode_a32.S z4/i2s_input_pi.c pll_out.c smi_out.c z4/main_z4.c z4/clk_dump.c z4/z4_prof.c z4/z4_mainloop.c z4/z4_globals.c z4/dspi_standins.c z4/spdif_rx_pi.c z4/adat_output_pi.c z4/soft_vcxo_pi.c z4/cpu_meter.c spdif_decode.c spdif_decode_a32.S smi_frame_a32.S pico_shim/pico_shim.c uac2/usb_descriptors.c)
     target_include_directories(pizero_z4 BEFORE PRIVATE ${CMAKE_CURRENT_LIST_DIR}/uac2 ${CMAKE_CURRENT_LIST_DIR}/pico_shim)
     target_link_libraries(pizero_z4 PRIVATE dspi_z4 tinyusb_uac2)
     target_link_options(pizero_z4 PRIVATE -Wl,--wrap=dcd_event_handler)    # USB event accounting, main_z4.c
     set_property(SOURCE mem_ops.c APPEND PROPERTY COMPILE_OPTIONS -fno-builtin -fno-tree-loop-distribute-patterns)
+    set_property(SOURCE i2s_rx_decode.c APPEND PROPERTY COMPILE_DEFINITIONS I2S_RX_A32)   # the assembly scan and frame builder
     pizero_image(pizero_z4)
 else()
     # ARM1176 cannot assemble usb_audio.c's RP2350 24-bit unpack (inline sbfx/bfi need ARMv6T2).

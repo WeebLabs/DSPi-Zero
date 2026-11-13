@@ -41,6 +41,15 @@ typedef struct {
 extern dma_hw_t pico_shim_dma_hw;
 #define dma_hw (&pico_shim_dma_hw)
 
+#define DMA_CH0_CTRL_TRIG_BUSY_BITS (1u << 26)
+
+static inline dma_channel_hw_t *dma_channel_hw_addr(uint channel) {
+    return &dma_hw->ch[channel & 15u];
+}
+static inline uint32_t dma_encode_endless_transfer_count(void) {
+    return 0xFu << 28;
+}
+
 enum dma_channel_transfer_size { DMA_SIZE_8 = 0, DMA_SIZE_16 = 1, DMA_SIZE_32 = 2 };
 
 typedef struct {
@@ -93,3 +102,9 @@ bool dma_channel_is_busy(uint channel);
 void dma_channel_set_irq0_enabled(uint channel, bool enabled);
 void dma_channel_set_irq1_enabled(uint channel, bool enabled);
 void dma_start_channel_mask(uint32_t chan_mask);
+static inline void dma_irqn_set_channel_enabled(uint irq_index, uint channel, bool enabled) {
+    (void)irq_index, (void)channel, (void)enabled;
+}
+static inline void dma_irqn_acknowledge_channel(uint irq_index, uint channel) {
+    (void)irq_index, (void)channel;
+}
