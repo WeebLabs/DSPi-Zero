@@ -182,11 +182,11 @@ def main():
         set_source(dev, SRC_USB)
         time.sleep(0.5)
         st = req(dev, REQ_SET_ADAT_ENABLE, 1)[0]
-        out_pin = req(dev, REQ_GET_ADAT_PIN)[0]
-        # The output's own pin is always accepted as the input's (DSPi's loopback); the Pi reads GPIO 20.
-        st_pin = req(dev, REQ_SET_ADAT_INPUT_PIN, out_pin)[0]
+        # The Pi reads ADAT on GPIO 20, the PCM block's input, which it shares with S/PDIF input 1.
+        in_pin = 20
+        st_pin = req(dev, REQ_SET_ADAT_INPUT_PIN, in_pin)[0]
         st_en = req(dev, REQ_SET_ADAT_INPUT_ENABLE, 1)[0]
-        print(f"ADAT output enable {st}, input pin {out_pin} {st_pin}, input enable {st_en} (0 is success)")
+        print(f"ADAT output enable {st}, input pin {in_pin} {st_pin}, input enable {st_en} (0 is success)")
         for o in range(8):
             set_output_enable(dev, o, 1)
         siggen(dev, True)

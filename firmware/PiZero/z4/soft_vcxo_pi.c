@@ -12,7 +12,8 @@
 #include "pll_out.h"
 #include "i2s_input_pi.h"
 
-#define MAX_PPM 300.0f
+// DSPi's clamp: IEC 60958-3 Level II sources may sit anywhere within +-1000 ppm.
+#define MAX_PPM 1000.0f
 
 static float current_ppm;
 

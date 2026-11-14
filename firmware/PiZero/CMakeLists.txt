@@ -304,6 +304,9 @@ if(PIZERO_BOARD STREQUAL "zero2")
     # This also makes vendor requests report WIRE_PLATFORM_RP2350 (1), so an unpatched DSPi Console
     # connects. Temporary, until the Zero gets its own platform ID.
     target_compile_definitions(dspi_z4 PUBLIC PICO_RP2350=1)
+    # DSPi's pin hooks (DSPi's platform_pins.h): the Pi's default pins, and z4/platform_pins_pi.c's rules.
+    target_compile_definitions(dspi_z4 PUBLIC DSPI_PLATFORM_PINS=1)
+    target_include_directories(dspi_z4 PUBLIC ${CMAKE_CURRENT_LIST_DIR}/platform_pins)
     target_link_libraries(dspi_z4 PUBLIC tinyusb_uac2)
     # DSPi builds hosted (so fabsf, fminf and the like are builtins), with -fcommon and gnu C. Its
     # warnings are silenced since its sources cannot change here.
@@ -347,7 +350,7 @@ if(PIZERO_BOARD STREQUAL "zero2")
         tud_descriptor_string_cb=dspi_tud_descriptor_string_cb
     )
 
-    add_executable(pizero_z4 ${PLATFORM_SRC} irq.c mem_ops.c pcm_out.c pcm_rx.c i2s_rx_decode.c i2s_rx_decode_a32.S z4/i2s_input_pi.c pll_out.c smi_out.c z4/main_z4.c z4/clk_dump.c z4/z4_prof.c z4/z4_mainloop.c z4/z4_globals.c z4/dspi_standins.c z4/pcm_capture_pi.c z4/spdif_rx_pi.c z4/adat_input_pi.c adat_decode.c adat_decode_a32.S z4/adat_output_pi.c z4/soft_vcxo_pi.c z4/cpu_meter.c spdif_decode.c spdif_decode_a32.S smi_frame_a32.S pico_shim/pico_shim.c uac2/usb_descriptors.c)
+    add_executable(pizero_z4 ${PLATFORM_SRC} irq.c mem_ops.c pcm_out.c pcm_rx.c i2s_rx_decode.c i2s_rx_decode_a32.S z4/i2s_input_pi.c pll_out.c smi_out.c z4/main_z4.c z4/clk_dump.c z4/z4_prof.c z4/z4_mainloop.c z4/z4_globals.c z4/platform_pins_pi.c z4/dspi_standins.c z4/pcm_capture_pi.c z4/spdif_rx_pi.c z4/adat_input_pi.c adat_decode.c adat_decode_a32.S z4/adat_output_pi.c z4/soft_vcxo_pi.c z4/cpu_meter.c spdif_decode.c spdif_decode_a32.S smi_frame_a32.S pico_shim/pico_shim.c uac2/usb_descriptors.c)
     target_include_directories(pizero_z4 BEFORE PRIVATE ${CMAKE_CURRENT_LIST_DIR}/uac2 ${CMAKE_CURRENT_LIST_DIR}/pico_shim)
     target_link_libraries(pizero_z4 PRIVATE dspi_z4 tinyusb_uac2)
     target_link_options(pizero_z4 PRIVATE -Wl,--wrap=dcd_event_handler)    # USB event accounting, main_z4.c
