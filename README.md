@@ -24,8 +24,16 @@ every output slot (I2S or S/PDIF) from one parallel SMI stream. The work is stil
 | I2S LRCLK | 13 | 33 |
 | MCK | 4 | 7 |
 | ADAT out | 16 | 36 |
-| S/PDIF in (3.3 V logic, such as an optical receiver module on 3.3 V) | 20 | 38 |
+| S/PDIF or ADAT in (3.3 V logic, such as an optical receiver module on 3.3 V) | 20 | 38 |
+| I2S input data, pair 1 (inputs 1-2) | 22 | 15 |
+| I2S input data, pair 2 (inputs 3-4) | 23 | 16 |
+| I2S input data, pair 3 (inputs 5-6) | 24 | 18 |
+| I2S input data, pair 4 (inputs 7-8) | 25 | 22 |
+| I2S BCK in, from an external master | 26 | 37 |
+| I2S LRCLK in, from an external master | 27 | 13 |
 
+In DSPi's I2S master and slave roles the input uses the outputs' BCK and LRCLK on GPIO 12 and 13. S/PDIF and
+ADAT input share GPIO 20, since DSPi runs only one of them at a time.
 Pins follow this table whatever DSPi Console's pin settings say. Presets are not yet kept across a power cycle.
 The card also carries the USB loader: `firmware/PiZero/tools/pizero_load.py` sends a newer build, which runs until
 the power is removed; copy it onto the card as `kernel.img` to keep it. `firmware/PiZero/tools/make_sd_image.sh`
