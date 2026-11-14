@@ -14,6 +14,7 @@
     .equ JOB_ADAT_KEY, 40
     .equ JOB_STRIDE, 44
     .equ JOB_STALE, 60
+    .equ JOB_MAP, 64
 
     // Stack while composing: the four raw pointers, then the frames written. While ADAT runs, a copy
     // of smi_adat_consts and d8-d15 lie between them: the copy is in a cache line every frame uses.
@@ -104,6 +105,59 @@
     vmull.p8 q13, d13, d13
     vshr.u8 q15, q13, #4
     vand    q13, q13, q7
+    vst4.8  {d24, d26, d28, d30}, [r0:256]!
+    vst4.8  {d25, d27, d29, d31}, [r0:256]!
+.endm
+
+// With a pin map: the next 16 cells at lr to 32 words through the tables, q0 the slots' low bytes and
+// q1 their high bytes, d4 and d5 the clocks' low and high bytes, q3 0x0F in every byte.
+.macro REMAP
+    vld1.8  {d20-d21}, [lr]!
+    vand    q14, q10, q3
+    vshr.u8 q15, q10, #4
+    vtbl.8  d24, {d0-d1}, d28
+    vtbl.8  d25, {d0-d1}, d29
+    vtbl.8  d26, {d2-d3}, d28
+    vtbl.8  d27, {d2-d3}, d29
+    vtbl.8  d28, {d4}, d30
+    vtbl.8  d29, {d4}, d31
+    vtbl.8  d30, {d5}, d30
+    vtbl.8  d31, {d5}, d31
+    vorr    q12, q12, q14
+    vorr    q13, q13, q15
+    vmov    q14, q12
+    vmov    q15, q13
+    vst4.8  {d24, d26, d28, d30}, [r0:256]!
+    vst4.8  {d25, d27, d29, d31}, [r0:256]!
+.endm
+
+// As REMAP, with ADAT: lev is 8 bytes of the 32-cell level spread, each byte two bits of the first, as
+// OUTV makes it. q8 and q9 shift a level (0 or 1) to ADAT's bit in the low and high bytes.
+.macro REMAPV lev
+    vld1.8  {d20-d21}, [lr]!
+    vmull.p8 q11, \lev, \lev          // a cell's two levels in bits 0 and 4
+    vand    q14, q10, q3
+    vshr.u8 q15, q10, #4
+    vtbl.8  d24, {d0-d1}, d28
+    vtbl.8  d25, {d0-d1}, d29
+    vtbl.8  d26, {d2-d3}, d28
+    vtbl.8  d27, {d2-d3}, d29
+    vtbl.8  d28, {d4}, d30
+    vtbl.8  d29, {d4}, d31
+    vtbl.8  d30, {d5}, d30
+    vtbl.8  d31, {d5}, d31
+    vorr    q12, q12, q14
+    vorr    q13, q13, q15
+    vshr.u8 q10, q11, #4
+    vand    q11, q11, q3
+    vshl.u8 q14, q10, q8
+    vshl.u8 q15, q10, q9
+    vorr    q14, q14, q12
+    vorr    q15, q15, q13
+    vshl.u8 q10, q11, q8
+    vshl.u8 q11, q11, q9
+    vorr    q12, q12, q10
+    vorr    q13, q13, q11
     vst4.8  {d24, d26, d28, d30}, [r0:256]!
     vst4.8  {d25, d27, d29, d31}, [r0:256]!
 .endm
@@ -367,7 +421,10 @@ smi_frames_a32:
     vzip.8  q2, q3
     vzip.8  q8, q9
     vzip.8  q10, q11
+    ldr     r12, [r1, #JOB_MAP]
     ldr     lr, [r1, #JOB_ADAT]
+    cmp     r12, #0
+    bne     60f
     cmp     lr, #0
     bne     30f
 
@@ -381,6 +438,45 @@ smi_frames_a32:
     OUT32   q9
     OUT32   q10
     OUT32   q11
+    pop     {r4-r7}
+    b       50f
+
+    // A pin map: the cells go to the stack, in the order they are sent, and the registers take the map.
+60: sub     sp, sp, #128
+    mov     r4, sp
+    vst1.8  {d0-d3}, [r4]!
+    vst1.8  {d4-d7}, [r4]!
+    vst1.8  {d16-d19}, [r4]!
+    vst1.8  {d20-d23}, [r4]
+    vld1.8  {d0-d3}, [r12]!
+    vld1.8  {d4-d5}, [r12]!
+    vmov.i8 q3, #0x0F
+    cmp     lr, #0
+    mov     lr, sp
+    bne     61f
+    REMAP
+    REMAP
+    REMAP
+    REMAP
+    REMAP
+    REMAP
+    REMAP
+    REMAP
+    b       62f
+61: vld1.8  {d16-d19}, [r12]
+    vmull.p8 q6, d8, d8
+    REMAPV  d12
+    REMAPV  d13
+    vmull.p8 q6, d9, d9
+    REMAPV  d12
+    REMAPV  d13
+    vmull.p8 q6, d10, d10
+    REMAPV  d12
+    REMAPV  d13
+    vmull.p8 q6, d11, d11
+    REMAPV  d12
+    REMAPV  d13
+62: add     sp, sp, #128
     pop     {r4-r7}
     b       50f
 

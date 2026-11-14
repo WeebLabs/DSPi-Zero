@@ -153,11 +153,12 @@ i2s_rx_scan_a32:
 // leave the word's four bytes first code first, so one byte reversal makes the stored word.
 
 //   q0-q3 codes 0 to 31, then their data bytes in q0, q1    q8-q11 codes 32 to 63, their bytes in q2, q3
-//   q12 work    q13 weights    q14, q15 work    r2 LRCLK's mask    r3 data line 0's bit    r12 destinations
+//   q12 work    q13 weights    q14 work    d30 the lines' masks    r2 LRCLK's mask    r3 the lowest data
+//   line's bit    r12 destinations
 
-// One data line: bit \bit of each code's byte into the two words at [\dst].
-.macro LINE bit, dst
-    vmov.i8 q12, #(1 << \bit)
+// Data line \k: its bit of each code's byte (mask d30[\k]) into the two words at [\dst].
+.macro LINE k, dst
+    vdup.8  q12, d30[\k]
     vtst.8  q8, q0, q12
     vtst.8  q9, q1, q12
     vtst.8  q10, q2, q12
@@ -208,7 +209,7 @@ i2s_rx_frame_a32:
     orrs    r0, r0, r2
     movne   r0, #0
     bxne    lr
-    // Each code's data nibble into the low bits of a byte.
+    // Each code's data lines into a byte, the lowest line in bit 0.
     rsb     r3, r3, #0
     vdup.16 q12, r3
     adr     r0, frame_weights
@@ -229,6 +230,8 @@ i2s_rx_frame_a32:
     vmovn.i16 d5, q9
     vmovn.i16 d6, q10
     vmovn.i16 d7, q11
+    add     r0, r12, #16
+    vld1.32 {d30[0]}, [r0]
     ldm     r12, {r0, r1, r2, r3}
     LINE    0, r0
     LINE    1, r1

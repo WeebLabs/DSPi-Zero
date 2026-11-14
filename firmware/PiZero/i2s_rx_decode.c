@@ -30,7 +30,15 @@ void i2s_rx_init(i2s_rx_t *d, const i2s_rx_pins_t *pins, uint32_t *const ring[I2
     d->pins = *pins;
     d->bck_mask = (uint16_t)(1u << (pins->bck - pins->shift));
     d->lr_mask = (uint16_t)(1u << (pins->lr - pins->shift));
-    d->data_shift = (uint32_t)pins->data - pins->shift;
+    uint32_t lo = pins->data[0];
+    for (uint32_t k = 1; k < I2S_RX_LINES; k++) {
+        lo = pins->data[k] < lo ? pins->data[k] : lo;
+    }
+    d->data_shift = lo - pins->shift;
+    for (uint32_t k = 0; k < I2S_RX_LINES; k++) {
+        d->line_bit[k] = (uint8_t)(pins->data[k] - lo);
+        d->data_mask |= (uint16_t)(1u << (pins->data[k] - pins->shift));
+    }
     for (uint32_t k = 0; k < I2S_RX_LINES; k++) {
         d->ring[k] = ring[k];
     }
@@ -60,7 +68,7 @@ static void finish_half(i2s_rx_t *d, uint32_t level, uint32_t n, bool gap) {
     uint32_t w[I2S_RX_LINES] = {0, 0, 0, 0};
     if (ok) {
         for (uint32_t k = 0; k < I2S_RX_LINES; k++) {
-            w[k] = word_of(d->half, d->data_shift + k);
+            w[k] = word_of(d->half, d->data_shift + d->line_bit[k]);
         }
     } else if (d->synced) {
         d->bad_halves++;
@@ -238,7 +246,7 @@ static bool rescue(i2s_rx_t *d) {
             // one may already show the bit after (the one at r[m]). A snapshot that shows neither
             // of those can only be the lost bit.
             const uint32_t *q = p + high;
-            uint32_t data = 0xFu << d->data_shift;
+            uint32_t data = d->data_mask;
             uint32_t before = code_of(d, *p) & data, after = code_of(d, *r[m]) & data;
             uint32_t q0 = code_of(d, q[0]) & data, q1 = code_of(d, q[1]) & data;
             if (q1 != after || low >= d->phase_max + 2u) {
@@ -378,8 +386,9 @@ uint32_t i2s_rx_frame_c(const uint16_t *codes, const i2s_rx_frame_t *f) {
         }
     }
     for (uint32_t k = 0; k < I2S_RX_LINES; k++) {
-        f->dst[k][0] = word_of(codes, f->data_shift + k);
-        f->dst[k][1] = word_of(codes + 32, f->data_shift + k);
+        uint32_t bit = f->data_shift + (uint32_t)__builtin_ctz(f->line_mask[k]);
+        f->dst[k][0] = word_of(codes, bit);
+        f->dst[k][1] = word_of(codes + 32, bit);
     }
     return 1;
 }
@@ -389,6 +398,9 @@ uint32_t i2s_rx_frame_c(const uint16_t *codes, const i2s_rx_frame_t *f) {
 static void frames(i2s_rx_t *d, bool all) {
     uint32_t i = 0, n = d->npend;
     i2s_rx_frame_t f = {.lr_mask = d->lr_mask, .data_shift = d->data_shift};
+    for (uint32_t k = 0; k < I2S_RX_LINES; k++) {
+        f.line_mask[k] = (uint8_t)(1u << d->line_bit[k]);
+    }
     while (i < n) {
         if (d->n == 0u && d->lr == 0u && d->gap == I2S_RX_GAP_NONE) {
             if (n - i < 64u) {

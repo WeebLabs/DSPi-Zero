@@ -1,7 +1,7 @@
 #pragma once
 
 // Decoder for an 8-channel I2S input captured as snapshots of the GPIO level register (GPLEV0): four data
-// lines on consecutive GPIOs sharing one BCK and LRCLK, 64 bit clocks a frame, Philips framing. It takes
+// lines within 8 consecutive GPIOs, in any order, sharing one BCK and LRCLK, 64 bit clocks a frame, Philips framing. It takes
 // the data at the first snapshot after each BCK rising edge and writes 32-bit words, MSB first and left
 // first, into one ring per stereo pair, as DSPi's PIO receiver does. No hardware is touched here.
 
@@ -14,17 +14,33 @@
 #define I2S_RX_PENDING (I2S_RX_SCAN_SAMPLES / 2u + 64u)
 
 // Where the signals sit. A snapshot's code is its 16 bits from bit `shift` up, and every signal must
-// lie in that window: BCK at GPIO bck, LRCLK at GPIO lr, data line k at GPIO data + k.
+// lie in that window: BCK at GPIO bck, LRCLK at GPIO lr, data line k at GPIO data[k]. The data lines
+// must also lie within 8 consecutive GPIOs (i2s_rx_pins_ok()). data is word aligned, since GCC copies it
+// as a word, which faults unaligned where the MMU is off (QEMU's test runs).
 typedef struct {
-    uint8_t shift, bck, lr, data;
+    uint8_t shift, bck, lr;
+    uint8_t data[I2S_RX_LINES] __attribute__((aligned(4)));
 } i2s_rx_pins_t;
+
+static inline bool i2s_rx_pins_ok(const i2s_rx_pins_t *p) {
+    uint32_t lo = p->data[0], hi = p->data[0];
+    for (uint32_t k = 1; k < I2S_RX_LINES; k++) {
+        lo = p->data[k] < lo ? p->data[k] : lo;
+        hi = p->data[k] > hi ? p->data[k] : hi;
+    }
+    uint32_t top = p->shift + 15u;
+    return hi - lo <= 7u && lo >= p->shift && hi <= top && p->bck >= p->shift && p->bck <= top &&
+           p->lr >= p->shift && p->lr <= top;
+}
 
 enum { I2S_RX_GAP_NONE, I2S_RX_GAP_ARMED, I2S_RX_GAP_FOUND };
 
 typedef struct {
     i2s_rx_pins_t pins;
     uint16_t bck_mask, lr_mask;     // in the code
-    uint32_t data_shift;            // code bit of data line 0
+    uint32_t data_shift;            // code bit of the lowest data line
+    uint8_t line_bit[I2S_RX_LINES]; // data line k's bit above that
+    uint16_t data_mask;             // every data line's bit in the code
     uint32_t *ring[I2S_RX_LINES];   // one per stereo pair
     uint32_t ring_mask;             // ring words - 1; the ring length is an even power of two
     uint32_t wr;                    // words written to each ring so far, two a frame
@@ -105,6 +121,7 @@ uint32_t i2s_rx_scan_a32(const uint32_t *samples, uint32_t n, i2s_rx_scan_t *s, 
 typedef struct {
     uint32_t lr_mask, data_shift;
     uint32_t *dst[I2S_RX_LINES];    // where each pair's left and right words go
+    uint8_t line_mask[I2S_RX_LINES];    // 1 << line_bit[k]
 } i2s_rx_frame_t;
 uint32_t i2s_rx_frame_c(const uint16_t *codes, const i2s_rx_frame_t *f);
 uint32_t i2s_rx_frame_a32(const uint16_t *codes, const i2s_rx_frame_t *f);

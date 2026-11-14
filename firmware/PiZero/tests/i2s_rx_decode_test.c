@@ -59,9 +59,13 @@ static uint32_t pins_at(const model_t *m, double t) {
     uint64_t dn = in >= m->tco_ns ? n : n - 1u;    // the cell whose data is on the pins
     uint32_t word = (uint32_t)(dn / 32u), bit = 31u - (uint32_t)(dn % 32u);
     uint32_t lr = (uint32_t)(((dn + 1u) / 32u) & 1u);
-    uint32_t v = rnd() & ~((0xFu << m->pins.data) | (1u << m->pins.bck) | (1u << m->pins.lr));
+    uint32_t used = 1u << m->pins.bck | 1u << m->pins.lr;
     for (uint32_t k = 0; k < I2S_RX_LINES; k++) {
-        v |= ((sent[word % RING][k] >> bit) & 1u) << (m->pins.data + k);
+        used |= 1u << m->pins.data[k];
+    }
+    uint32_t v = rnd() & ~used;
+    for (uint32_t k = 0; k < I2S_RX_LINES; k++) {
+        v |= ((sent[word % RING][k] >> bit) & 1u) << m->pins.data[k];
     }
     return v | bck << m->pins.bck | lr << m->pins.lr;
 }
@@ -175,7 +179,7 @@ static void run(const char *name, const model_t *m, uint32_t n_samples, int want
 
 // Arbitrary snapshots: nothing to decode, but both decoders must do the same thing with them.
 static void fuzz(uint32_t rounds) {
-    static const i2s_rx_pins_t pins = {.shift = 8, .bck = 12, .lr = 13, .data = 8};
+    static const i2s_rx_pins_t pins = {.shift = 8, .bck = 12, .lr = 13, .data = {8, 9, 10, 11}};
     uint32_t differ = 0, total = 0;
     for (uint32_t r = 0; r < rounds; r++) {
         i2s_rx_t *d = calloc(2, sizeof(i2s_rx_t));
@@ -227,7 +231,7 @@ static void fuzz(uint32_t rounds) {
 
 // A ring lead (DSPi's master role reads pair 0 one frame on) must move that line's words and no others.
 static void lead(uint32_t rounds) {
-    static const i2s_rx_pins_t pins = {.shift = 8, .bck = 12, .lr = 13, .data = 8};
+    static const i2s_rx_pins_t pins = {.shift = 8, .bck = 12, .lr = 13, .data = {8, 9, 10, 11}};
     uint32_t differ = 0, total = 0;
     for (uint32_t r = 0; r < rounds; r++) {
         i2s_rx_t *d = calloc(2, sizeof(i2s_rx_t));
@@ -277,9 +281,9 @@ static void lead(uint32_t rounds) {
 }
 
 int main(void) {
-    static const i2s_rx_pins_t loop = {.shift = 8, .bck = 12, .lr = 13, .data = 8};
-    static const i2s_rx_pins_t own = {.shift = 12, .bck = 12, .lr = 13, .data = 22};
-    static const i2s_rx_pins_t ext = {.shift = 12, .bck = 26, .lr = 27, .data = 22};
+    static const i2s_rx_pins_t loop = {.shift = 8, .bck = 12, .lr = 13, .data = {8, 9, 10, 11}};
+    static const i2s_rx_pins_t own = {.shift = 12, .bck = 12, .lr = 13, .data = {22, 23, 24, 25}};
+    static const i2s_rx_pins_t ext = {.shift = 12, .bck = 26, .lr = 27, .data = {22, 23, 24, 25}};
     static const struct {
         const char *name;
         double fs, step, extra;
@@ -287,9 +291,12 @@ int main(void) {
                  {"96 kHz, 30.5 MS/s", 96000, 31.5, 5.5},   {"44.1 kHz, 18 MS/s", 44100, 50, 22},
                  {"48 kHz, 18 MS/s", 48000, 50, 22},        {"48 kHz, 13.4 MS/s", 48000, 62, 50}};
     char name[80];
-    // BCK in every nibble, byte and half of the word, which are the assembly scan's eight cases.
-    static const i2s_rx_pins_t spread[] = {{0, 2, 3, 4},    {0, 4, 5, 8},     {8, 9, 10, 12},   {8, 12, 13, 8},
-                                           {16, 18, 19, 20}, {16, 22, 23, 24}, {12, 26, 27, 22}, {16, 30, 31, 24}};
+    // BCK in every nibble, byte and half of the word, which are the assembly scan's eight cases, and the
+    // data lines in other orders and spread over up to 8 GPIOs.
+    static const i2s_rx_pins_t spread[] = {
+        {0, 2, 3, {4, 5, 6, 7}},         {0, 4, 5, {8, 11, 9, 10}},       {8, 9, 10, {15, 14, 13, 12}},
+        {8, 12, 13, {11, 8, 10, 9}},     {16, 18, 19, {20, 27, 22, 25}},  {16, 22, 23, {26, 24, 27, 25}},
+        {12, 26, 27, {22, 23, 24, 25}},  {16, 30, 31, {24, 29, 26, 28}}};
     for (unsigned v = 0; v < sizeof(spread) / sizeof(spread[0]); v++) {
         model_t m = {.bck_ns = 1e9 / (64.0 * 96000), .step_ns = 31.5, .step_extra_ns = 5.5, .jitter_ns = 4,
                      .tco_ns = 6, .gap_ns = 90, .gap_every = 3000, .pins = spread[v]};

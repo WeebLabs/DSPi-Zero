@@ -12,6 +12,7 @@ bool z4_stream_running(void);   // the consumer is feeding received audio into t
 uint32_t z4_host_rate(void);    // the rate the host set on the UAC2 clock
 uint32_t shim_output_clock(void);   // pico_shim.c: frames played at the output rate, from the SMI once it runs
 void shim_smi_start(void);          // pico_shim.c: start every output on the SMI
+void shim_smi_pins_poll(void);      // pico_shim.c: follow a BCK pin change
 uint32_t shim_smi_snapshot(uint16_t *out, uint32_t n);  // bench: n composed frames, returns the first
 
 // z4_mainloop.c

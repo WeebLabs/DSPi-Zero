@@ -418,13 +418,58 @@ uint pio_get_gpio_base(PIO pio) {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// GPIO: remembered function and direction only
+// GPIO: the RP2350's calls on the BCM2837's GPIO block. The function and direction are remembered as
+// DSPi set them. A call reaches the pin only while it is SIO and a plain input or output in GPFSEL, so a
+// pin that the SMI, PCM block or a GPCLK holds (an ALT function) is never touched. GPIO 0 and 1 are kept
+// for a HAT's ID EEPROM. gpio_get() reads the pin's level, as on the RP2350.
+
+#define GPIO_REG(off) (*(volatile uint32_t *)(0x3F200000u + (off)))
+#define GPSET0 0x1Cu
+#define GPCLR0 0x28u
+#define GPLEV0 0x34u
+#define GPPUD 0x94u
+#define GPPUDCLK0 0x98u
 
 static uint8_t gpio_fn[NUM_BANK0_GPIOS];
 static uint64_t gpio_out_dir, gpio_out_level;
 
 static inline uint gpio_idx(uint gpio) {
     return gpio < NUM_BANK0_GPIOS ? gpio : NUM_BANK0_GPIOS - 1u;
+}
+
+static inline uint32_t gpio_fsel(uint gpio) {
+    return GPIO_REG(4u * (gpio / 10u)) >> (3u * (gpio % 10u)) & 7u;
+}
+
+// True when DSPi may drive this pin: a header GPIO it holds as SIO that no block has taken.
+static bool gpio_general(uint gpio) {
+    return gpio >= 2u && gpio <= 27u && gpio_fn[gpio] == GPIO_FUNC_SIO && gpio_fsel(gpio) <= 1u;
+}
+
+// GPFSEL to input or output, if the pin is still a plain input or output when interrupts are off.
+static void gpio_apply_dir(uint gpio, bool out) {
+    uint32_t reg = 4u * (gpio / 10u), shift = 3u * (gpio % 10u);
+    uint32_t save = save_and_disable_interrupts();
+    uint32_t v = GPIO_REG(reg);
+    if ((v >> shift & 7u) <= 1u) {
+        GPIO_REG(reg) = (v & ~(7u << shift)) | ((out ? 1u : 0u) << shift);
+    }
+    restore_interrupts(save);
+}
+
+// The BCM2837's pull sequence: the control, a wait, a clock to the pin, a wait, then both cleared.
+static void gpio_apply_pull(uint gpio, uint32_t pud) {
+    if (gpio < 2u || gpio > 27u || gpio_fsel(gpio) > 1u) {
+        return;
+    }
+    uint32_t save = save_and_disable_interrupts();
+    GPIO_REG(GPPUD) = pud;
+    board_delay_us(1);
+    GPIO_REG(GPPUDCLK0) = 1u << gpio;
+    board_delay_us(1);
+    GPIO_REG(GPPUD) = 0;
+    GPIO_REG(GPPUDCLK0) = 0;
+    restore_interrupts(save);
 }
 
 void gpio_init(uint gpio) {
@@ -436,7 +481,19 @@ void gpio_deinit(uint gpio) {
     gpio_set_function(gpio, GPIO_FUNC_NULL);
 }
 void gpio_set_function(uint gpio, gpio_function_t fn) {
+    bool was = gpio < NUM_BANK0_GPIOS && gpio_general(gpio);
     gpio_fn[gpio_idx(gpio)] = (uint8_t)fn;
+    if (gpio >= NUM_BANK0_GPIOS) {
+        return;
+    }
+    if (gpio_general(gpio)) {
+        if (gpio_get_dir(gpio)) {
+            GPIO_REG((gpio_out_level >> gpio & 1u) ? GPSET0 : GPCLR0) = 1u << gpio;
+        }
+        gpio_apply_dir(gpio, gpio_get_dir(gpio));
+    } else if (was) {
+        gpio_apply_dir(gpio, false);    // left SIO: back to an input
+    }
 }
 gpio_function_t gpio_get_function(uint gpio) {
     // The table starts zeroed, but the RP2350 resets every pin to NULL.
@@ -446,6 +503,9 @@ gpio_function_t gpio_get_function(uint gpio) {
 void gpio_set_dir(uint gpio, bool out) {
     uint64_t bit = 1ull << gpio_idx(gpio);
     gpio_out_dir = out ? (gpio_out_dir | bit) : (gpio_out_dir & ~bit);
+    if (gpio < NUM_BANK0_GPIOS && gpio_general(gpio)) {
+        gpio_apply_dir(gpio, out);
+    }
 }
 bool gpio_get_dir(uint gpio) {
     return (gpio_out_dir >> gpio_idx(gpio)) & 1u;
@@ -453,18 +513,24 @@ bool gpio_get_dir(uint gpio) {
 void gpio_put(uint gpio, bool value) {
     uint64_t bit = 1ull << gpio_idx(gpio);
     gpio_out_level = value ? (gpio_out_level | bit) : (gpio_out_level & ~bit);
+    if (gpio < NUM_BANK0_GPIOS && gpio_general(gpio)) {
+        GPIO_REG(value ? GPSET0 : GPCLR0) = 1u << gpio;
+    }
 }
 bool gpio_get(uint gpio) {
+    if (gpio <= 27u) {
+        return (GPIO_REG(GPLEV0) >> gpio) & 1u;
+    }
     return (gpio_out_level >> gpio_idx(gpio)) & 1u;
 }
 void gpio_pull_up(uint gpio) {
-    (void)gpio;
+    gpio_apply_pull(gpio, 2u);
 }
 void gpio_pull_down(uint gpio) {
-    (void)gpio;
+    gpio_apply_pull(gpio, 1u);
 }
 void gpio_disable_pulls(uint gpio) {
-    (void)gpio;
+    gpio_apply_pull(gpio, 0u);
 }
 void gpio_set_input_enabled(uint gpio, bool enabled) {
     (void)gpio, (void)enabled;
@@ -927,6 +993,8 @@ static void shim_output_clock_set_rate(uint32_t freq) {
 // channel-status bit taken from the absolute frame index modulo 192 when the frame is written.
 #include "smi_frame.h"
 
+static void smi_pins_update(void);    // the SMI composer section below
+
 static uint8_t spdif_channel_status[5] = {0x04, 0x00, 0x00, 0x02, 0x0B};   // byte 3: sample rate
 static uint32_t spdif_idle[SMI_SPDIF_BLOCK][2];     // the silent frame at each block phase
 
@@ -1018,6 +1086,7 @@ void audio_spdif_setup(audio_spdif_instance_t *inst, uint32_t sample_freq, const
     if (spdif_instance_count < PICO_AUDIO_SPDIF_MAX_INSTANCES) {
         spdif_instances[spdif_instance_count++] = inst;
     }
+    smi_pins_update();
 }
 
 void audio_spdif_set_enabled(audio_spdif_instance_t *inst, bool enabled) {
@@ -1042,6 +1111,7 @@ void audio_spdif_change_pin(audio_spdif_instance_t *inst, uint new_pin) {
 void audio_spdif_attach_pin(audio_spdif_instance_t *inst, uint new_pin) {
     gpio_set_function(new_pin, (gpio_function_t)pio_get_funcsel(inst->pio));
     inst->pin = (uint8_t)new_pin;
+    smi_pins_update();
 }
 
 void audio_spdif_teardown(audio_spdif_instance_t *inst) {
@@ -1061,6 +1131,7 @@ void audio_spdif_teardown(audio_spdif_instance_t *inst) {
     }
     restore_interrupts(save);
     inst->enabled = false;
+    smi_pins_update();
 }
 
 uint32_t audio_spdif_enable_sync_prepare(audio_spdif_instance_t *instances[], uint count) {
@@ -1152,6 +1223,7 @@ void audio_i2s_setup(audio_i2s_instance_t *inst, uint32_t sample_freq, const aud
     if (i2s_instance_count < PICO_AUDIO_I2S_MAX_INSTANCES) {
         i2s_instances[i2s_instance_count++] = inst;
     }
+    smi_pins_update();
 }
 
 void audio_i2s_set_enabled(audio_i2s_instance_t *inst, bool enabled) {
@@ -1176,6 +1248,7 @@ void audio_i2s_change_data_pin(audio_i2s_instance_t *inst, uint new_pin) {
 void audio_i2s_attach_data_pin(audio_i2s_instance_t *inst, uint new_pin) {
     gpio_set_function(new_pin, (gpio_function_t)pio_get_funcsel(inst->pio));
     inst->data_pin = (uint8_t)new_pin;
+    smi_pins_update();
 }
 
 uint32_t audio_i2s_enable_sync_prepare(audio_i2s_instance_t *instances[], uint count) {
@@ -1237,6 +1310,7 @@ void audio_i2s_teardown(audio_i2s_instance_t *inst) {
     }
     restore_interrupts(save);
     memset(inst, 0, sizeof(*inst));
+    smi_pins_update();
 }
 
 void audio_i2s_update_all_frequencies(uint32_t sample_freq) {
@@ -1262,14 +1336,15 @@ bool audio_i2s_extclk_framing_slipped(void) {
     return false;
 }
 
-// MCK always comes out on GPIO 4 (GPCLK0), from the SMI's clock (smi_out_mck()). DSPi's MCK pin is kept
-// as bookkeeping only, as the output pins are.
+// MCK comes from the SMI's clock (smi_out_mck()) on GPIO 4 or 5, whichever DSPi's MCK pin is. The Pi's
+// pin rules refuse any other, so a pin smi_out_mck_pin() cannot take leaves MCK where it was.
 static uint8_t mck_pin = 0xff;
 static bool mck_enabled;
 static uint32_t mck_mult = 256;
 
 void audio_i2s_mck_setup(uint pin) {
     mck_pin = (uint8_t)pin;
+    smi_out_mck_pin(pin);
 }
 void audio_i2s_mck_set_enabled(bool enabled) {
     mck_enabled = enabled && mck_pin != 0xff;
@@ -1284,6 +1359,7 @@ void audio_i2s_mck_update_frequency(uint32_t sample_freq, uint32_t multiplier) {
 }
 void audio_i2s_mck_change_pin(uint new_pin) {
     mck_pin = (uint8_t)new_pin;
+    smi_out_mck_pin(new_pin);
 }
 uint8_t audio_i2s_mck_get_pin(void) {
     return mck_pin;
@@ -1296,18 +1372,17 @@ void audio_i2s_mck_apply_state(uint pin, bool enabled, uint32_t sample_freq, uin
         return;
     }
     mck_pin = (uint8_t)pin;
+    smi_out_mck_pin(pin);
     audio_i2s_mck_update_frequency(sample_freq, multiplier);
     audio_i2s_mck_set_enabled(enabled);
 }
 
 // ---------------------------------------------------------------------------------------------------
 // SMI composer: every slot ring onto one parallel stream, 256 words per frame, so all outputs change on
-// the same SMI cycle. Slot n's data is SD n (GPIO 8 + n); the I2S bit clock is SD4 (GPIO 12) and LRCLK
-// SD5 (GPIO 13). An S/PDIF cell lasts 2 words and an I2S bit clock 4, at every sample rate.
+// the same SMI cycle. Each output's pin is an SD line (SD n is GPIO 8 + n), set by smi_pins_update(). An
+// S/PDIF cell lasts 2 words and an I2S bit clock 4, at every sample rate.
 
 #define SMI_SLOTS 4u
-#define SMI_BIT_ADAT 8u   // SD8, GPIO 16, claimed only while ADAT is enabled
-#define SMI_PIN_MASK (0x3Fu << 8)
 // One S/PDIF channel-status block, the period of a stream of silence: each ring frame then already holds
 // the frame it is next due, and the composer leaves it. The ring is not cached, so the DMA reads what
 // the NEON stores wrote with no cache maintenance.
@@ -1330,6 +1405,16 @@ static const uint32_t *adat_ring;
 static uint32_t adat_ring_frames, adat_start;
 static volatile bool adat_on;
 
+// Output pins (GPIO plan, phase 3). The SMI holds the pin of each slot that has an instance, DSPi's BCK
+// and LRCLK pins, and the ADAT pin while ADAT is enabled; a pin it no longer needs goes back to an input.
+// A layout other than the native one gives the composer a pin map, and its keys a lap of being stale.
+extern uint8_t i2s_bck_pin;             // DSPi: the outputs' BCK, LRCLK on the next pin
+uint8_t adat_output_pi_pin(void);       // z4/adat_output_pi.c: the pin ADAT was started on, 0xFF for none
+static smi_pinmap_t smi_map __attribute__((aligned(16)));
+static bool smi_map_on;
+static uint32_t smi_map_gen, smi_claimed;
+static uint8_t smi_adat_pin = 0xFF, smi_bck_seen = 0xFF;
+
 static void shim_adat_enable(bool on) {
     if (on) {
         dma_channel_hw_t *ch = &pico_shim_dma_hw.ch[ADAT_DMA_CH];
@@ -1339,9 +1424,12 @@ static void shim_adat_enable(bool on) {
     }
     adat_on = on && adat_ring && adat_ring_frames;
     // As on the RP2350, a stopped stream holds the pin low until ADAT is disabled, which frees it.
-    if (adat_on || !adat_output_config_enabled()) {
-        smi_out_pin(8u + SMI_BIT_ADAT, adat_on);
+    if (adat_on) {
+        smi_adat_pin = adat_output_pi_pin();
+    } else if (!adat_output_config_enabled()) {
+        smi_adat_pin = 0xFF;
     }
+    smi_pins_update();
 }
 
 typedef struct {
@@ -1351,12 +1439,75 @@ typedef struct {
     uint8_t i2s;
 } comp_slot_t;
 
+static inline uint32_t smi_slot_of(const void *ring) {
+    return (uint32_t)((const uint8_t *)ring - slot_ring_store) / PICO_AUDIO_SPDIF_RING_BYTES;
+}
+
+static inline bool smi_line_ok(uint32_t gpio) {
+    return gpio >= 8u && gpio <= 23u;
+}
+
+static void smi_pins_update(void) {
+    uint8_t line[SMI_LINES] = {0, 1, 2, 3, 4, 5, 8};
+    uint32_t want = 0, bck = i2s_bck_pin;
+    uint32_t save = save_and_disable_interrupts();
+    for (uint i = 0; i < spdif_instance_count; i++) {
+        audio_spdif_instance_t *inst = spdif_instances[i];
+        uint32_t slot = smi_slot_of(inst->ring);
+        if (inst->ring && slot < SMI_SLOTS && smi_line_ok(inst->pin)) {
+            line[slot] = (uint8_t)(inst->pin - 8u);
+            want |= 1u << inst->pin;
+        }
+    }
+    for (uint i = 0; i < i2s_instance_count; i++) {
+        audio_i2s_instance_t *inst = i2s_instances[i];
+        uint32_t slot = smi_slot_of(inst->ring);
+        if (inst->ring && slot < SMI_SLOTS && smi_line_ok(inst->data_pin)) {
+            line[slot] = (uint8_t)(inst->data_pin - 8u);
+            want |= 1u << inst->data_pin;
+        }
+    }
+    if (smi_line_ok(bck) && smi_line_ok(bck + 1u)) {
+        line[SMI_LINE_BCK] = (uint8_t)(bck - 8u);
+        line[SMI_LINE_LRCLK] = (uint8_t)(bck - 7u);
+        want |= 3u << bck;
+    } else {
+        want |= 3u << 12;
+    }
+    if (smi_line_ok(smi_adat_pin)) {
+        line[SMI_LINE_ADAT] = (uint8_t)(smi_adat_pin - 8u);
+        want |= 1u << smi_adat_pin;
+    }
+    smi_pinmap_t m;
+    bool moved = smi_pinmap_build(&m, line);
+    if (moved != smi_map_on || (moved && memcmp(&m, &smi_map, sizeof m) != 0)) {
+        smi_map = m;
+        smi_map_on = moved;
+        smi_map_gen++;
+    }
+    for (uint32_t g = 8; g <= 23u; g++) {
+        if ((want ^ smi_claimed) >> g & 1u) {
+            smi_out_pin(g, want >> g & 1u);
+        }
+    }
+    smi_claimed = want;
+    smi_bck_seen = (uint8_t)bck;
+    restore_interrupts(save);
+}
+
+// From the main loop: DSPi can move BCK without rebuilding an instance.
+void shim_smi_pins_poll(void) {
+    if (i2s_bck_pin != smi_bck_seen) {
+        smi_pins_update();
+    }
+}
+
 static uint32_t smi_gather(comp_slot_t *slots, bool *any_i2s) {
     uint32_t n = 0;
     *any_i2s = false;
     for (uint i = 0; i < spdif_instance_count; i++) {
         audio_spdif_instance_t *inst = spdif_instances[i];
-        uint32_t slot = (uint32_t)((uint8_t *)inst->ring - slot_ring_store) / PICO_AUDIO_SPDIF_RING_BYTES;
+        uint32_t slot = smi_slot_of(inst->ring);
         if (inst->enabled && inst->ring && slot < SMI_SLOTS) {
             slots[n++] = (comp_slot_t){(const uint32_t *)inst->ring, inst->consumed_frames - inst->last_read_time_us,
                                        (uint8_t)slot, 0};
@@ -1364,7 +1515,7 @@ static uint32_t smi_gather(comp_slot_t *slots, bool *any_i2s) {
     }
     for (uint i = 0; i < i2s_instance_count; i++) {
         audio_i2s_instance_t *inst = i2s_instances[i];
-        uint32_t slot = (uint32_t)((uint8_t *)inst->ring - slot_ring_store) / PICO_AUDIO_SPDIF_RING_BYTES;
+        uint32_t slot = smi_slot_of(inst->ring);
         if (inst->enabled && inst->ring && slot < SMI_SLOTS) {
             slots[n++] = (comp_slot_t){(const uint32_t *)inst->ring, inst->consumed_frames - inst->last_read_time_us,
                                        (uint8_t)slot, 1};
@@ -1379,7 +1530,7 @@ static uint32_t smi_gather(comp_slot_t *slots, bool *any_i2s) {
 // slot types, or a gap in what was composed, the keys are not trusted for one lap of the ring.
 static uint32_t smi_compose(uint32_t frame, uint16_t *dst, uint32_t ring_idx, uint32_t n) {
     static const uint32_t zeros[4];
-    static uint32_t last_cfg, next_idx, stale_frames;
+    static uint32_t last_cfg, last_gen, next_idx, stale_frames;
     comp_slot_t found[2u * SMI_SLOTS];
     bool any_i2s;
     uint32_t nf = smi_gather(found, &any_i2s);
@@ -1388,7 +1539,7 @@ static uint32_t smi_compose(uint32_t frame, uint16_t *dst, uint32_t ring_idx, ui
     const uint32_t *ring[SMI_SLOTS];
     uint32_t offset[SMI_SLOTS], wrap[SMI_SLOTS][4];
     bool adat = adat_on;
-    smi_frame_job_t job = {.raw = {zeros, zeros, zeros, zeros}, .clocks = any_i2s};
+    smi_frame_job_t job = {.raw = {zeros, zeros, zeros, zeros}, .clocks = any_i2s, .map = smi_map_on ? &smi_map : NULL};
     uint32_t cfg = 1u << 31 | (uint32_t)adat << 9 | (uint32_t)any_i2s << 8;
     for (uint32_t s = 0; s < nf; s++) {
         uint32_t slot = found[s].bit;
@@ -1398,10 +1549,11 @@ static uint32_t smi_compose(uint32_t frame, uint16_t *dst, uint32_t ring_idx, ui
         job.stride[slot] = found[s].i2s ? 8u : SMI_SPDIF_STRIDE;
         cfg |= job.type[slot] << (2u * slot);
     }
-    if (cfg != last_cfg || ring_idx != next_idx) {
+    if (cfg != last_cfg || smi_map_gen != last_gen || ring_idx != next_idx) {
         stale_frames = SMI_RING_FRAMES;
     }
     last_cfg = cfg;
+    last_gen = smi_map_gen;
     next_idx = ring_idx + n == SMI_RING_FRAMES ? 0 : ring_idx + n;
     job.stale = stale_frames;
     stale_frames -= n < stale_frames ? n : stale_frames;
@@ -1461,9 +1613,10 @@ static uint32_t smi_compose(uint32_t frame, uint16_t *dst, uint32_t ring_idx, ui
 // Starts the SMI stream (before DSPi creates its slots), and from then on the output clock is its frame count.
 void shim_smi_start(void) {
     smi_spdif_silence_init(spdif_idle, spdif_channel_status);
-    if (smi_out_start(smi_ring, SMI_RING_FRAMES, oc_freq, SMI_PIN_MASK, smi_compose)) {
+    if (smi_out_start(smi_ring, SMI_RING_FRAMES, oc_freq, 0, smi_compose)) {
         oc_smi = true;
     }
+    smi_pins_update();
 }
 
 // Bench: copies n frames that are composed but not yet sent, and returns the first one's frame number.

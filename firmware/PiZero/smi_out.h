@@ -41,8 +41,10 @@ void smi_out_reclock(void);     // sets the clock up again at the same rate, aft
 enum { SMI_SRC_PLLD, SMI_SRC_PLLA };
 void smi_out_set_source(uint32_t src);
 uint32_t smi_out_source(void);
-// MCK on GPIO 4 (GPCLK0) at mult (128 or 256) times the SMI's rate, locked to the SMI clock; 0 stops it.
+// MCK at mult (128 or 256) times the SMI's rate, locked to the SMI clock; 0 stops it. It comes out on
+// GPIO 4 (GPCLK0) or, after smi_out_mck_pin(5), GPIO 5 (GPCLK1); any other pin is refused.
 void smi_out_mck(uint32_t mult);
+bool smi_out_mck_pin(uint32_t gpio);
 // Hands a GPIO to the SMI (its SD bit in the stream) or returns it to an input, for pins used part-time.
 void smi_out_pin(uint32_t gpio, bool on);
 uint32_t smi_out_frames(void);      // frames the DMA has read; safe from any context

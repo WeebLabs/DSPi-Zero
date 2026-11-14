@@ -62,8 +62,10 @@
 #define PHASE_SAMPLES 2048u     // snapshots the clock follower looks at
 #define PHASE_EVERY 4u          // on one tick in this many
 #define RING_WORDS INPUT_ARENA_I2S_WORDS
-#define OWN_BCK 12u             // the SMI's BCK, LRCLK next to it
-#define SHIFT 12u               // snapshot window: GPIO 12-27
+#define DEF_SHIFT 12u           // the fallback pins: window GPIO 12-27, data 22-25, BCK 12 or 26
+#define DEF_DATA 22u
+#define DEF_OWN_BCK 12u
+#define DEF_EXT_BCK 26u
 
 typedef struct {
     uint32_t ti, src, dst, len, stride, next, pad[2];
@@ -81,6 +83,7 @@ static int32_t pcm_ring[4096 * 2] __attribute__((section(".nocache"), aligned(32
 static uint32_t *const cap = (uint32_t *)CAP_BASE;
 static i2s_rx_t dec;
 static i2s_rx_pins_t pins;
+static uint32_t own_bck;        // the SMI's BCK, LRCLK next to it, while the capture runs
 static uint32_t period_q8;
 static i2s_input_pi_bench_t bench;
 static i2s_input_pi_status_t st = {
@@ -174,7 +177,7 @@ static void check_sine(void) {
 // How far the SMI's clocks lag the master's, from the same snapshots: BCK rises give the lag within one
 // bit clock, as a circular mean over many edges, and LRCLK falls say which bit clock.
 static void measure_phase(const uint32_t *s, uint32_t n) {
-    uint32_t eb = 1u << pins.bck, el = 1u << pins.lr, ob = 1u << OWN_BCK, ol = 1u << (OWN_BCK + 1u);
+    uint32_t eb = 1u << pins.bck, el = 1u << pins.lr, ob = 1u << own_bck, ol = 1u << (own_bck + 1u);
     uint32_t hist[32] = {0}, last_e = 0, have_e = 0, rises = 0, first_e = 0, last_el = 0, have_el = 0, nl = 0;
     uint32_t first_o = 0, last_o = 0, own_rises = 0;
     int32_t dl[8];
@@ -432,6 +435,41 @@ static bool pins_fit(uint32_t shift, uint32_t pin) {
     return pin >= shift && pin < shift + 16u;
 }
 
+// A plain output back to an input; a pin an ALT function holds is left alone.
+static void make_input(uint32_t gpio) {
+    uint32_t shift = 3u * (gpio % 10u);
+    uint32_t save = irq_global_disable();
+    uint32_t v = REG(GPFSEL(gpio / 10u));
+    if ((v >> shift & 7u) == 1u) {
+        REG(GPFSEL(gpio / 10u)) = v & ~(7u << shift);
+    }
+    irq_global_restore(save);
+}
+
+// DSPi's pins (GPIO plan, phase 5), or the bench's: the data line of each pair in use, the outputs' BCK
+// and, with an external master, DSPi's slave BCK. The window starts at the lowest pin the capture reads.
+// A set that breaks the decoder's rules (i2s_rx_pins_ok()) falls back to the pins of the README.
+static void choose_pins(bool ext) {
+    uint32_t own = i2s_bck_pin, ext_bck = bench.ext_bck ? bench.ext_bck : i2s_bck_pin_slave;
+    uint32_t bck = ext ? ext_bck : own, lo = bck;
+    i2s_rx_pins_t p = {0, (uint8_t)bck, (uint8_t)(bck + 1u), {0}};
+    for (uint32_t k = 0; k < I2S_RX_LINES; k++) {
+        uint32_t d = bench.data ? bench.data + k : i2s_rx_pin[k];
+        p.data[k] = (uint8_t)(k < st.pairs ? d : p.data[0]);     // a pair not in use repeats line 0
+        lo = p.data[k] < lo ? p.data[k] : lo;
+    }
+    lo = ext && own < lo ? own : lo;
+    p.shift = (uint8_t)(bench.shift ? bench.shift : lo);
+    if (!i2s_rx_pins_ok(&p) || p.lr > 27u || (ext && (!pins_fit(p.shift, own) || !pins_fit(p.shift, own + 1u)))) {
+        own = DEF_OWN_BCK;
+        bck = ext ? DEF_EXT_BCK : DEF_OWN_BCK;
+        p = (i2s_rx_pins_t){DEF_SHIFT, (uint8_t)bck, (uint8_t)(bck + 1u),
+                            {DEF_DATA, DEF_DATA + 1u, DEF_DATA + 2u, DEF_DATA + 3u}};
+    }
+    pins = p;
+    own_bck = own;
+}
+
 static void start(void) {
     static uint32_t arm_size;
     for (uint32_t i = 0, base = 0; i < 4u && arm_size == 0u; i++) {
@@ -459,23 +497,15 @@ static void start(void) {
     uint32_t pairs = i2s_input_channels / 2u;
     st.pairs = pairs < 1u ? 1u : pairs > I2S_RX_LINES ? I2S_RX_LINES : pairs;
 
-    uint32_t shift = bench.shift ? bench.shift : SHIFT;
-    uint32_t data = bench.data ? bench.data : I2S_INPUT_PI_DATA;
-    uint32_t ext_bck = bench.ext_bck ? bench.ext_bck : I2S_INPUT_PI_EXT_BCK;
-    uint32_t bck = ext ? ext_bck : OWN_BCK;
-    if (!pins_fit(shift, bck + 1u) || !pins_fit(shift, bck) || !pins_fit(shift, data) ||
-        !pins_fit(shift, data + 3u) || (ext && (!pins_fit(shift, OWN_BCK) || !pins_fit(shift, OWN_BCK + 1u)))) {
-        shift = SHIFT;
-        data = I2S_INPUT_PI_DATA;
-        bck = ext ? I2S_INPUT_PI_EXT_BCK : OWN_BCK;
-    }
-    pins = (i2s_rx_pins_t){(uint8_t)shift, (uint8_t)bck, (uint8_t)(bck + 1u), (uint8_t)data};
-    // The production pins as inputs (GPIO 20-29 are GPFSEL2); the bench sets up its own.
-    if (!bench.data) {
-        REG(GPFSEL(2)) &= ~(0xFFFu << 6);       // 22-25
+    choose_pins(ext);
+    uint32_t bck = pins.bck;
+    // The pins read as inputs; the bench sets up its own.
+    for (uint32_t k = 0; k < I2S_RX_LINES && !bench.data; k++) {
+        make_input(pins.data[k]);
     }
     if (ext && !bench.ext_bck) {
-        REG(GPFSEL(2)) &= ~(0x3Fu << 18);       // 26, 27
+        make_input(pins.bck);
+        make_input(pins.lr);
     }
 
     // At 48 kHz and below 8 wait cycles halve the snapshots and the decoding. An external master's

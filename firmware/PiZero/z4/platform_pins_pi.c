@@ -1,6 +1,7 @@
 // The Zero 2 W's pin rules for DSPi's DSPI_PLATFORM_PINS hooks (DSPi's platform_pins.h), from the
-// hardware table in Documentation/Porting/PiZero_GPIO_plan.md. Each rule is what the hardware can do;
-// until the port moves a function to the pin it is given, that function stays on its default.
+// hardware table in Documentation/Porting/PiZero_GPIO_plan.md. Each rule is what the hardware can do
+// for one pin. The I2S input's pins must also fit its snapshot window together (i2s_input_pi.h), which a
+// rule for one pin cannot check, so a set that does not fit falls back to the default pins at start.
 
 #include "platform_pins.h"
 #include "control_surfaces.h"
@@ -9,8 +10,6 @@
 #define HEADER_LAST     27u
 #define SMI_FIRST       8u      // SD0 to SD15 at 16 bits
 #define SMI_LAST        23u
-#define WINDOW_FIRST    12u     // the I2S input's 16-pin snapshot window
-#define WINDOW_LAST     27u
 #define PCM_DIN         20u
 
 static bool in(uint8_t pin, uint32_t first, uint32_t last) {
@@ -24,11 +23,8 @@ bool dspi_platform_pin_valid(uint8_t fn, uint8_t pin) {
         case DSPI_PIN_FN_ADAT_OUT:
         case DSPI_PIN_FN_I2S_CLK:
             return in(pin, SMI_FIRST, SMI_LAST);
-        case DSPI_PIN_FN_I2S_CLK_SLAVE:
-        case DSPI_PIN_FN_I2S_RX:
-            return in(pin, WINDOW_FIRST, WINDOW_LAST);
         case DSPI_PIN_FN_MCK:
-            return pin == 4u;   // GPCLK0; GPCLK1 (GPIO 5) and GPCLK2 (GPIO 6) once proven free
+            return pin == 4u || pin == 5u;  // GPCLK0, GPCLK1; GPCLK2 is the wireless chip's clock
         case DSPI_PIN_FN_SPDIF_RX:
         case DSPI_PIN_FN_ADAT_IN:
             return pin == PCM_DIN;

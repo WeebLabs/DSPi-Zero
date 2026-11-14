@@ -175,6 +175,55 @@ static inline void smi_adat_levels(const uint32_t *f, uint32_t w[8]) {
     }
 }
 
+// Output pins on any SD lines (GPIO plan, phase 3). A job with a map moves each bit of the native word
+// (slot n on bit n, BCK on 4, LRCLK on 5, ADAT on 8) to its own line by table, before the stores. A job
+// without one has the native layout and takes the original path. 80 bytes, read in this order.
+typedef struct {
+    uint8_t lo[16], hi[16];             // a cell's 4 slot levels to the word's low and high bytes
+    uint8_t clk_lo[8], clk_hi[8];       // BCK (bit 0) and LRCLK (bit 1) to the low and high bytes
+    int8_t adat_lo[16], adat_hi[16];    // shifts taking ADAT's level to its bit in each byte, -8 for none
+} smi_pinmap_t;
+
+enum { SMI_LINE_BCK = 4, SMI_LINE_LRCLK, SMI_LINE_ADAT, SMI_LINES };
+
+// line[] gives the SD line for slots 0 to 3, BCK, LRCLK and ADAT. Returns false for the native layout,
+// which needs no map. Lines a job never sets (a slot that is off, the clocks without I2S) may repeat.
+static inline bool smi_pinmap_build(smi_pinmap_t *m, const uint8_t line[SMI_LINES]) {
+    static const uint8_t native[SMI_LINES] = {0, 1, 2, 3, 4, 5, 8};
+    bool same = true;
+    for (uint32_t b = 0; b < SMI_LINES; b++) {
+        same &= line[b] == native[b];
+    }
+    for (uint32_t v = 0; v < 16u; v++) {
+        uint32_t w = 0;
+        for (uint32_t s = 0; s < 4u; s++) {
+            w |= (v >> s & 1u) << line[s];
+        }
+        m->lo[v] = (uint8_t)w;
+        m->hi[v] = (uint8_t)(w >> 8);
+    }
+    for (uint32_t v = 0; v < 8u; v++) {
+        uint32_t w = (v & 1u) << line[SMI_LINE_BCK] | (v >> 1 & 1u) << line[SMI_LINE_LRCLK];
+        m->clk_lo[v] = (uint8_t)w;
+        m->clk_hi[v] = (uint8_t)(w >> 8);
+    }
+    uint32_t a = line[SMI_LINE_ADAT];
+    for (uint32_t i = 0; i < 16u; i++) {
+        m->adat_lo[i] = (int8_t)(a < 8u ? (int)a : -8);
+        m->adat_hi[i] = (int8_t)(a >= 8u ? (int)a - 8 : -8);
+    }
+    return !same;
+}
+
+// One native word through the map.
+static inline uint16_t smi_pinmap_word(const smi_pinmap_t *m, uint32_t w) {
+    uint32_t c = w & 0x3Fu, a = w >> 8 & 1u;
+    uint32_t lo = m->lo[c & 15u] | m->clk_lo[c >> 4], hi = m->hi[c & 15u] | m->clk_hi[c >> 4];
+    lo |= m->adat_lo[0] >= 0 ? a << m->adat_lo[0] : 0u;
+    hi |= m->adat_hi[0] >= 0 ? a << m->adat_hi[0] : 0u;
+    return (uint16_t)(lo | hi << 8);
+}
+
 // raw[s] is 4 words of slot s's ring. For S/PDIF they are the frame's left and right words, then the
 // next frame's, which only the key takes in. For I2S they are the frame before's L and R, then L and R,
 // of which the R before's LSB and L, R are sent. A slot that is off has zeros. adat is the frame's 8
@@ -187,6 +236,7 @@ typedef struct {
     uint32_t *adat_key;         // the ADAT words each frame was made from, 8 a frame, used while adat is set
     uint32_t stride[4];         // bytes from one frame's raw words to the next frame's
     uint32_t stale;             // not 0: the keys do not describe dst, so every frame is written
+    const smi_pinmap_t *map;    // the lines, or NULL for the native layout
 } smi_frame_job_t;
 
 // Composes n frames of 256 words to dst, the inputs (raw by its stride, adat by 8 words) and the 16-word
@@ -326,6 +376,9 @@ static inline bool smi_frame_c(uint16_t *dst, const uint32_t *const raw[4], cons
                                                : vdupq_n_u8(0);
     }
     smi_frame_store(dst, lv, job->clocks != 0, job->adat);
+    for (uint32_t j = 0; job->map && j < 256u; j++) {
+        dst[j] = smi_pinmap_word(job->map, dst[j]);
+    }
     return true;
 }
 

@@ -1,18 +1,18 @@
 #pragma once
 
 // The Pi's I2S receiver under DSPi's i2s_input.c, which is compiled unchanged: the shim (pico_shim.c)
-// passes DSPi's calls for its PIO receiver on pio2 here. Four data lines on GPIO 22-25 are decoded from
-// the same snapshots, so the eight channels stay sample-aligned. BCK and LRCLK are the SMI's own (GPIO
-// 12 and 13) in DSPi's master and slave roles.
+// passes DSPi's calls for its PIO receiver on pio2 here. Four data lines (DSPi's I2S input pins, GPIO
+// 22-25 by default) are decoded from the same snapshots, so the eight channels stay sample-aligned. BCK
+// and LRCLK are the SMI's own (DSPi's BCK pin, GPIO 12 and 13 by default) in DSPi's master and slave roles.
 
 #include <stdbool.h>
 #include <stdint.h>
 
-// With an external clock master, BCK and LRCLK come in on GPIO 26 and 27 whatever DSPi's pin settings
-// say. The SMI's own clocks (GPIO 12 and 13) are then phase-locked to them by trimming PLLA, so every
-// output, S/PDIF and ADAT included, runs on the master's clock and a DAC may take either pair.
-#define I2S_INPUT_PI_DATA 22u
-#define I2S_INPUT_PI_EXT_BCK 26u
+// With an external clock master, BCK and LRCLK come in on DSPi's slave BCK pin and the next (GPIO 26
+// and 27 by default), in either clock-pin mode, since the SMI always drives its own. Those are then
+// phase-locked to the master by trimming PLLA, so every output, S/PDIF and ADAT included, runs on the
+// master's clock and a DAC may take either pair. Every pin the capture reads must lie within 16 GPIOs,
+// and the data lines within 8, or the pins above are used instead.
 
 // From the shim, for DSPi's state machines on pio2: pio_enable_sm_mask_in_sync starts the receiver or,
 // while it runs, makes it frame afresh (i2s_input_resync); the last pio_sm_unclaim stops it.
@@ -36,7 +36,7 @@ enum {
     I2S_INPUT_PI_KEEP_LINES = 1u << 2,      // leave the decoded snapshots in the cache, as before the fix
 };
 typedef struct {
-    uint8_t shift, data, ext_bck;           // snapshot window base, data line 0, external BCK
+    uint8_t shift, data, ext_bck;           // snapshot window base, data line 0 (the rest follow), external BCK
     uint8_t flags;
     uint8_t check_lines;                    // bit k: data line k must carry a sine on both channels
     uint8_t pad[3];

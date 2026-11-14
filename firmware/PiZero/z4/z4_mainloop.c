@@ -1497,6 +1497,7 @@ void z4_dspi_service(void) {
     service_ctrl_interfaces();
     service_control_surfaces();
     service_dac_hw_mute();
+    shim_smi_pins_poll();
     service_eq_update();
 
     // Rate changes from DSPi itself (I2S or ADAT rate, a switch back to USB). The USB host's own rate

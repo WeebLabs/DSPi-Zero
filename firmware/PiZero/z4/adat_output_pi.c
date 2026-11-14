@@ -238,6 +238,7 @@ void adat_output_set_config(bool enabled, uint8_t pin) {
 
 bool    adat_output_config_enabled(void) { return adat_cfg_enabled != 0; }
 uint8_t adat_output_pin(void)            { return adat_cfg_pin; }
+uint8_t adat_output_pi_pin(void)         { return adat_hw_pin; }    // pico_shim.c: the pin in use
 
 // Sampled per packet by the DSP pipeline to pick the slot finalization mode
 // (see output_s24.h); must stay RAM-resident like its caller.

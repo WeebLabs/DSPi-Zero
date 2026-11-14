@@ -20,9 +20,9 @@ DSPi lets the user move every function to the GPIO they choose. On the Pi, every
 | Output slots 1 to 4 (S/PDIF or I2S data) | SMI data lines | GPIO 8 to 23 (SD0 to SD15) | The SMI runs 16 bits wide. Any slot can take any line. |
 | I2S BCK and LRCLK out | SMI data lines | GPIO 8 to 23 | DSPi requires LRCLK = BCK + 1, which the SMI can meet anywhere in the range. |
 | ADAT out | SMI data line | GPIO 8 to 23 | |
-| MCK | GPCLK0, 1 or 2 | GPIO 4, 5, 6 (also 20, 21) | GPIO 4 is proven. Whether the VideoCore leaves GPCLK1 and GPCLK2 free has to be checked. 20 and 21 collide with the PCM block. |
+| MCK | GPCLK0 or 1 | GPIO 4, 5 | At boot GPCLK0 and GPCLK1 are stopped. GPCLK2 (GPIO 6) runs at 32.8 kHz from the crystal, the wireless chip's sleep clock, so it is left alone. GPIO 20 and 21 collide with the PCM block. |
 | S/PDIF and ADAT in | PCM block's PCM_DIN | GPIO 20 only | The other PCM_DIN pins are not on the header. |
-| I2S input data, BCK and LRCLK in | GPIO snapshot (GPLEV0) | Any 16 consecutive GPIOs that hold all of them | The decoder reads a 16-bit window of each snapshot. |
+| I2S input data, BCK and LRCLK in | GPIO snapshot (GPLEV0) | Any header GPIOs, if all of them lie within 16 and the data lines within 8 | The decoder reads a 16-bit window of each snapshot and gathers the data lines from one byte of it. |
 | DAC mute, control surfaces, general I/O | Plain GPIO | GPIO 2 to 27 | GPIO 0 and 1 are kept for a HAT's ID EEPROM. |
 | UART control | PL011 or mini UART | GPIO 14 and 15 | They are the only UART pins on the header. |
 | I2C control and displays | BSC1 | GPIO 2 and 3 | They have fixed 1.8 kΩ pull-ups on the board. |
@@ -47,6 +47,28 @@ DSPi's rules and defaults are compiled into DSPi's own files, and the preset-res
 - An RP build that defined `DSPI_PLATFORM_PINS` by mistake would stop with a missing `dspi_platform_pins.h`, rather than build differently.
 
 A second, smaller question concerns DSPi Console. It decides which pins to offer from the platform ID, and the port reports itself as an RP2350. The Console needs either a Pi platform ID or, better, a request the device answers with its own list of pins for each function. That is a change to DSPi and to the Console.
+
+## Progress
+
+Phases 1 to 5 and the bench tool of phase 8 are written and pass their tests off the board. On the board (2026-11-14), `pin_assign_check.py` passed: output slot 1, BCK and LRCLK, ADAT and MCK each moved to their new pin and left the old one, and all nine invalid pins were refused. DSPi itself refuses a BCK move while an I2S output runs and an MCK move while MCK is on (`PIN_CONFIG_OUTPUT_ACTIVE`), as on the RP2350, so the tool moves those first. `smi_check.py`, `spdif_cs_check.py`, `mck_check.py`, `adat_check.py --watch 20` and `spdif_in_check.py --source --watch 20` passed on the default pins.
+
+The composer's cost with the 1 kHz tone at 48 kHz, where about 92% of frames repeat and are not written:
+
+| Layout | Cycles a frame |
+|---|---|
+| Default pins | 120, 122 |
+| Slot 1 on GPIO 17 (a map) | 130, 133 |
+| Default pins, ADAT | 172 |
+| ADAT on GPIO 19 (a map) | 188 |
+
+The map adds about 135 cycles to each frame that is written, more than the instruction count suggested. With every frame written, as with music, that is about 0.65% of the core at 48 kHz and 1.3% at 96 kHz. The default pins cost what they did before.
+
+- **Phase 1.** The shim's GPIO calls drive a pin only while DSPi holds it as SIO and GPFSEL shows a plain input or output. A pin that the SMI, PCM block or a GPCLK holds is never touched, and GPIO 0 and 1 are never driven.
+- **Phase 2.** The rules and defaults are the hooks above.
+- **Phase 3.** The composer takes a pin map (`smi_pinmap_t` in `smi_frame.h`) when any output is off its native line. Each word's bits go through 16-entry tables before the stores. The native layout takes the old path, so today's pins cost only the map test, three instructions a written frame. `tests/smi_frame_test.c` checks the C and the assembly against a bit-by-bit move of the reference words, for random line sets with and without ADAT, under QEMU; two deliberately broken copies of the assembly fail it. The SMI holds exactly the pins in use (each slot's, BCK and LRCLK, and ADAT's while enabled) and returns any other to an input. Its cost on the board is below.
+- **Phase 4.** MCK moves between GPCLK0 (GPIO 4) and GPCLK1 (GPIO 5) with DSPi's MCK pin.
+- **Phase 5.** The I2S input reads DSPi's pair pins, DSPi's BCK pin and, with an external master, DSPi's slave BCK pin, in either clock-pin mode. The window starts at the lowest pin read. The decoder's per-line masks replace `data + k` at no cost, and `tests/i2s_rx_decode_test.c` covers lines in other orders and spread over 8 GPIOs. A set that does not fit falls back to the README's pins.
+- **Phase 8.** `tools/pin_assign_check.py` moves output slot 1, BCK and LRCLK, ADAT and MCK to other pins and reads them with the toggle probe, and checks that pins the Pi cannot drive are refused. It plays a tone straight to the Pi and puts every setting back.
 
 ## Phases
 

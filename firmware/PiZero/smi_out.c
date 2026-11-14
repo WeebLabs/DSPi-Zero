@@ -36,8 +36,8 @@
 #define CM_KILL (1u << 5)
 #define CM_BUSY (1u << 7)
 #define CM_MASH1 (1u << 9)
-#define CM_GP0CTL 0x3F101070u
-#define CM_GP0DIV 0x3F101074u
+#define CM_GPCTL(n) (0x3F101070u + 8u * (n))     // GPCLK n on GPIO 4 + n
+#define CM_GPDIV(n) (0x3F101074u + 8u * (n))
 #define GPFSEL0 0x3F200000u
 
 #define DMA_BASE 0x3F007000u
@@ -74,7 +74,8 @@ static uint32_t word_rem;           // words read past the last whole frame
 static uint32_t last_us;
 static uint32_t l_refresh_at;
 static uint32_t source = SMI_SRC_PLLA;     // the preferred source; PLLD is the fallback (PLLA plan phase 6)
-static uint32_t mck_mult, mck_ctl, mck_div;     // MCK: multiplier (0 = off) and what GPCLK0 was given
+static uint32_t mck_mult, mck_ctl, mck_div;     // MCK: multiplier (0 = off) and what its GPCLK was given
+static uint32_t mck_gp;                         // MCK's GPCLK: 0 (GPIO 4) or 1 (GPIO 5)
 
 static uint32_t micros(void) {
     return REG(0x3F003004u);
@@ -110,7 +111,7 @@ static void cm_stop(uint32_t ctl_reg) {
     }
 }
 
-// MCK on GPCLK0 (GPIO 4) runs from the SMI's source at the SMI divider times 768 / multiplier, so it is
+// MCK on GPCLK0 or GPCLK1 (GPIO 4 or 5) runs from the SMI's source at the SMI divider times 768 / multiplier, so it is
 // a fixed fraction of the SMI clock through every PLLA move, trim and fallback. On PLLA the divider is
 // an integer; on PLLD it carries the SMI's fraction, dithered by MASH 1 the same way.
 static void mck_apply(void) {
@@ -122,13 +123,14 @@ static void mck_apply(void) {
     if (ctl == mck_ctl && div == mck_div) {
         return;
     }
-    cm_stop(CM_GP0CTL);
-    uint32_t fsel = REG(GPFSEL0) & ~(7u << 12);
+    cm_stop(CM_GPCTL(mck_gp));
+    uint32_t shift = 12u + 3u * mck_gp;     // GPIO 4 + mck_gp in GPFSEL0
+    uint32_t fsel = REG(GPFSEL0) & ~(7u << shift);
     if (ctl) {
-        REG(CM_GP0DIV) = CM_PASSWD | div;
-        REG(CM_GP0CTL) = CM_PASSWD | ctl;
-        REG(CM_GP0CTL) = CM_PASSWD | ctl | CM_ENAB;
-        fsel |= 4u << 12;   // ALT0: GPCLK0
+        REG(CM_GPDIV(mck_gp)) = CM_PASSWD | div;
+        REG(CM_GPCTL(mck_gp)) = CM_PASSWD | ctl;
+        REG(CM_GPCTL(mck_gp)) = CM_PASSWD | ctl | CM_ENAB;
+        fsel |= 4u << shift;    // ALT0: GPCLK
     }
     REG(GPFSEL0) = fsel;
     mck_ctl = ctl;
@@ -326,6 +328,25 @@ void smi_out_pin(uint32_t gpio, bool on) {
     uint32_t save = irq_global_disable();
     REG(reg) = (REG(reg) & ~(7u << shift)) | (on ? 5u << shift : 0u);   // ALT1: SMI, or an input
     irq_global_restore(save);
+}
+
+// GPCLK2 (GPIO 6) is the wireless chip's 32 kHz clock, which the firmware leaves running.
+bool smi_out_mck_pin(uint32_t gpio) {
+    if (gpio != 4u && gpio != 5u) {
+        return false;
+    }
+    uint32_t save = irq_global_disable();
+    if (gpio - 4u != mck_gp) {
+        uint32_t mult = mck_mult;
+        mck_mult = 0;
+        mck_apply();            // stops the old clock and returns its pin to an input
+        mck_gp = gpio - 4u;
+        mck_mult = mult;
+        mck_ctl = mck_div = 0;
+        mck_apply();
+    }
+    irq_global_restore(save);
+    return true;
 }
 
 void smi_out_mck(uint32_t mult) {

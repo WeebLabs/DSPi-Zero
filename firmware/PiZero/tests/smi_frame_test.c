@@ -285,6 +285,32 @@ static uint32_t check(frames_fn fn, const char *name, const smi_frame_job_t *job
     return bad != 0;
 }
 
+// Seven different SD lines for the slots, BCK, LRCLK and ADAT, sometimes the native ones.
+static void random_lines(uint8_t line[SMI_LINES]) {
+    static const uint8_t native[SMI_LINES] = {0, 1, 2, 3, 4, 5, 8};
+    uint8_t all[16];
+    for (uint32_t i = 0; i < 16u; i++) {
+        all[i] = (uint8_t)i;
+    }
+    for (uint32_t i = 15; i > 0; i--) {
+        uint32_t j = rnd() % (i + 1u);
+        uint8_t x = all[i];
+        all[i] = all[j];
+        all[j] = x;
+    }
+    memcpy(line, rnd() % 8u == 0 ? native : all, SMI_LINES);
+}
+
+// A native word on those lines, a bit at a time.
+static uint16_t moved_word(uint16_t w, const uint8_t line[SMI_LINES]) {
+    static const uint8_t bit[SMI_LINES] = {0, 1, 2, 3, 4, 5, 8};
+    uint32_t out = 0;
+    for (uint32_t b = 0; b < SMI_LINES; b++) {
+        out |= (uint32_t)(w >> bit[b] & 1u) << line[b];
+    }
+    return (uint16_t)out;
+}
+
 static uint32_t shaped(uint32_t shape) {  // random, all zeros, all ones, sparse
     return shape == 0 ? rnd() : shape == 1 ? 0u : shape == 2 ? 0xFFFFFFFFu : 1u << (rnd() % 32u);
 }
@@ -464,6 +490,23 @@ int main(void) {
             reference(&want[k * 256u], in, job.type, job.clocks, job.adat ? &adat_old[8u * k] : NULL);
         }
         fails += check(smi_frames_c, "smi_frames_c", &job, n, want);
+        // The same frames on other lines.
+        {
+            static smi_pinmap_t map __attribute__((aligned(16)));
+            static uint16_t moved[RUN * 256];
+            uint8_t line[SMI_LINES];
+            random_lines(line);
+            smi_pinmap_build(&map, line);
+            for (uint32_t k = 0; k < n * 256u; k++) {
+                moved[k] = moved_word(want[k], line);
+            }
+            smi_frame_job_t mj = job;
+            mj.map = &map;
+            fails += check(smi_frames_c, "smi_frames_c on other lines", &mj, n, moved);
+#ifdef __arm__
+            fails += check(smi_frames_a32, "smi_frames_a32 on other lines", &mj, n, moved);
+#endif
+        }
 #ifdef __arm__
         fails += check(smi_frames_a32, "smi_frames_a32", &job, n, want);
         // Ring words the writer never makes must still compose as the C does.

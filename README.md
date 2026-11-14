@@ -34,7 +34,7 @@ every output slot (I2S or S/PDIF) from one parallel SMI stream. The work is stil
 
 In DSPi's I2S master and slave roles the input uses the outputs' BCK and LRCLK on GPIO 12 and 13. S/PDIF and
 ADAT input share GPIO 20, since DSPi runs only one of them at a time.
-Pins follow this table whatever DSPi Console's pin settings say. Presets are not yet kept across a power cycle.
+These are the default pins. DSPi Console's pin settings move them within what the Pi allows (`Documentation/Porting/PiZero_GPIO_plan.md`). Presets are not yet kept across a power cycle.
 The card also carries the USB loader: `firmware/PiZero/tools/pizero_load.py` sends a newer build, which runs until
 the power is removed; copy it onto the card as `kernel.img` to keep it. `firmware/PiZero/tools/make_sd_image.sh`
 builds the card image on a Mac.
