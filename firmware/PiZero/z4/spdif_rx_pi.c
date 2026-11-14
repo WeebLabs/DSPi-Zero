@@ -1,7 +1,7 @@
 // pico_spdif_rx's API (spdif_rx.h) on the Pi, for DSPi's spdif_input.c, which is compiled unchanged.
-// The PCM block samples GPIO 20 at 125 MHz from PLLD, which input tracking never moves, and a DMA loop
-// fills a ring a chunk at a time. Each chunk's interrupt decodes it (spdif_decode.c) and builds 384-
-// subframe blocks into the library's FIFO, with the library's lock states, callbacks and block timing.
+// The PCM block samples GPIO 20 at 125 MHz (pcm_capture_pi.c). Each chunk's interrupt decodes it
+// (spdif_decode.c) and builds 384-subframe blocks into the library's FIFO, with the library's lock
+// states, callbacks and block timing.
 
 #include <string.h>
 
@@ -9,77 +9,23 @@
 #include "input_capture_arena.h"
 
 #include "irq.h"
-#include "mbox.h"
-#include "pll_out.h"
+#include "pcm_capture_pi.h"
 #include "spdif_decode.h"
 #include "spdif_rx_pi.h"
 #include "pmu.h"
 
-void data_invalidate(volatile void *starting_address, size_t size);
-
-#define REG(a) (*(volatile uint32_t *)(a))
-
-#define PCM_CS 0x3F203000u
-#define PCM_MODE 0x3F203008u
-#define PCM_RXC 0x3F20300Cu
-#define PCM_TXC 0x3F203010u
-#define PCM_DREQ 0x3F203014u
-#define PCM_INTEN 0x3F203018u
-#define PCM_FIFO_BUS 0x7E203004u
-#define CS_EN (1u << 0)
-#define CS_RXON (1u << 1)
-#define CS_RXCLR (1u << 4)
-#define CS_DMAEN (1u << 9)
-#define CS_RXERR (1u << 16)
-#define CS_SYNC (1u << 24)
-#define CS_STBY (1u << 25)
-#define GPFSEL2 0x3F200008u
-
-#define DMA_BASE 0x3F007000u
-#define DMA_ENABLE 0x3F007FF0u
-#define DMA_CS(ch) (DMA_BASE + 0x100u * (ch) + 0x00u)
-#define DMA_CONBLK(ch) (DMA_BASE + 0x100u * (ch) + 0x04u)
-#define DMA_DEST(ch) (DMA_BASE + 0x100u * (ch) + 0x10u)
-#define DMA_DEBUG(ch) (DMA_BASE + 0x100u * (ch) + 0x20u)
-#define DMA_CS_RESET (1u << 31)
-#define DMA_CS_INT (1u << 2)
-#define DMA_CS_RUN ((1u << 28) | (8u << 20) | (8u << 16) | 1u)
-#define DMA_TI_INTEN (1u << 0)
-#define DMA_TI_WAIT_RESP (1u << 3)
-#define DMA_TI_DEST_INC (1u << 4)
-#define DMA_TI_SRC_DREQ (1u << 10)
-#define DMA_TI_PERMAP_PCM_RX (3u << 16)
-#define DMA_TI_NO_WIDE_BURSTS (1u << 26)
-#define BUS(p) ((uint32_t)(p) | 0xC0000000u)
-
-#define SRC_PLLD 6u
-#define PLLD_DIV 4u
-#define SAMPLE_HZ 125000000u        // 500 MHz PLLD / 4
-#define CHUNK_WORDS 4096u           // 131072 samples, about 1 ms
-#define CHUNKS 8u
-#define CHUNK_BYTES (CHUNK_WORDS * 4u)
-#define DIN_GPIO_SHIFT 0u           // GPIO 20 in GPFSEL2
+#define SAMPLE_HZ PCM_CAPTURE_SAMPLE_HZ
 #define STABLE_BLOCKS 4u            // aligned blocks at one rate before STABLE
 #define DECODE_TIMEOUT_US 10000u    // no block for this long loses the signal
-
-typedef struct {
-    uint32_t ti, src, dst, len, stride, next, pad[2];
-} dma_cb_t;
-
-static dma_cb_t cbs[CHUNKS] __attribute__((section(".nocache"), aligned(32)));
-#define RING_WORDS (CHUNKS * CHUNK_WORDS)
-// The DMA fills RING_WORDS; the tail after them repeats the ring's start for the decoder.
-static uint32_t ring[RING_WORDS + SPDIF_RING_TAIL] __attribute__((aligned(64)));
+#define CAPTURE_CHUNK_SAMPLES 131072u   // pcm_capture_pi.c's chunk
 
 #define fifo_buff (input_capture_arena.spdif_fifo)
-_Static_assert(((CHUNKS * CHUNK_WORDS) & (CHUNKS * CHUNK_WORDS - 1u)) == 0, "the decoder's ring is a power of two");
+_Static_assert(PCM_CAPTURE_TAIL >= SPDIF_RING_TAIL, "the capture's tail covers the decoder's look-ahead");
 _Static_assert(sizeof(input_capture_arena.spdif_fifo) == SPDIF_RX_FIFO_SIZE * 4, "arena S/PDIF FIFO size");
 
 static spdif_rx_config_t gcfg;
-static uint32_t dma_ch = 0xFF;
-static volatile bool running;
-static uint32_t next_chunk;
-static uint64_t cap_end;        // samples in completed chunks since the start
+static volatile bool running;   // the capture is this receiver's
+static uint64_t cap_end;        // samples handed over so far
 static spdif_decoder_t dec;
 
 static volatile spdif_rx_state_t state;
@@ -113,27 +59,12 @@ static inline uint32_t fifo_used(void) {
 static volatile uint32_t block_ref_seq, block_ref_count;
 static volatile uint64_t block_ref_time_us;
 
-// The interrupt's time and the sample index the DMA had reached then, for timing a sample index.
-static uint64_t irq_us, irq_index;
-static uint32_t irqs, decode_us;
-static uint32_t inv_cycles, dec_cycles, dec_ev[PMU_N_EVENTS];
+static uint32_t decode_us;
+static uint32_t dec_cycles, dec_ev[PMU_N_EVENTS];
 static bool monitor;
 
 static uint32_t micros(void) {
-    return REG(0x3F003004u);
-}
-
-static uint64_t micros64(void) {
-    uint32_t hi = REG(0x3F003008u), lo = REG(0x3F003004u);
-    if (hi != REG(0x3F003008u)) {
-        hi = REG(0x3F003008u);
-        lo = REG(0x3F003004u);
-    }
-    return (uint64_t)hi << 32 | lo;
-}
-
-static uint64_t time_of(uint64_t at) {
-    return irq_us - (irq_index - at) / (SAMPLE_HZ / 1000000u);
+    return *(volatile uint32_t *)0x3F003004u;
 }
 
 static spdif_rx_samp_freq_t classify(float hz) {
@@ -166,11 +97,11 @@ static __attribute__((noinline)) void block_done(void) {
     samp_freq_actual = hz;
     parity_err_count += rx.blk_parity;
     block_count++;
-    last_block_us = (uint32_t)irq_us;
+    last_block_us = (uint32_t)pcm_capture_irq_us();
     block_ref_seq++;
     __asm__ volatile("dmb" ::: "memory");
     block_ref_count = block_count;
-    block_ref_time_us = time_of(rx.blk_at);
+    block_ref_time_us = pcm_capture_time_of(rx.blk_at);
     __asm__ volatile("dmb" ::: "memory");
     block_ref_seq++;
     if (!rx.blk_ok || sf == SAMP_FREQ_NONE || (state == SPDIF_RX_STATE_STABLE && sf != samp_freq)) {
@@ -244,126 +175,26 @@ static void on_subframe(uint32_t w, uint64_t at, void *ctx) {
     }
 }
 
-// Drops a chunk the DMA has rewritten from the cache. Chunks are whole cache lines that only the DMA
-// writes, so there is nothing to clean first, and discarding is cheaper than data_invalidate.
-static void chunk_invalidate(const uint32_t *chunk) {
-    for (uintptr_t a = (uintptr_t)chunk, end = a + CHUNK_BYTES; a < end; a += 64u) {
-        __asm__ volatile("mcr p15, 0, %0, c7, c6, 1" ::"r"(a));     // DCIMVAC
-    }
-    __asm__ volatile("dsb" ::: "memory");
-}
-
-static void dma_irq(void) {
-    REG(DMA_CS(dma_ch)) = DMA_CS_RUN | DMA_CS_INT;
-    if (!running) {
-        return;
-    }
-    irq_us = micros64();
-    uint32_t off = REG(DMA_DEST(dma_ch)) - BUS(ring);
-    if (off >= RING_WORDS * 4u) {
-        return;     // between control blocks; the next interrupt catches up
-    }
-    uint32_t cur = off / CHUNK_BYTES;
-    irqs++;
-    uint32_t c0 = pmu_cycles();
-    while (next_chunk != cur) {
-        chunk_invalidate(&ring[next_chunk * CHUNK_WORDS]);
-        if (next_chunk == 0) {
-            memcpy(&ring[RING_WORDS], ring, SPDIF_RING_TAIL * 4u);
-        }
-        cap_end += CHUNK_WORDS * 32u;
-        next_chunk = (next_chunk + 1u) % CHUNKS;
-    }
-    inv_cycles += pmu_cycles() - c0;
-    irq_index = cap_end + (off % CHUNK_BYTES) / 4u * 32u;
+// Each capture chunk, in its interrupt.
+static void on_capture(const uint32_t *ring, uint32_t ring_words, uint64_t end) {
+    uint32_t irq_us = (uint32_t)pcm_capture_irq_us();
+    cap_end = end;
     // A decoder that fell most of a ring behind gives up the old samples rather than read overwritten ones.
-    if (cap_end - spdif_decode_needs(&dec, cap_end) > (CHUNKS - 2u) * CHUNK_WORDS * 32u) {
-        spdif_decode_skip(&dec, cap_end - CHUNK_WORDS * 32u);
+    if (end - spdif_decode_needs(&dec, end) > (uint64_t)ring_words * 32u - 2u * CAPTURE_CHUNK_SAMPLES) {
+        spdif_decode_skip(&dec, end - CAPTURE_CHUNK_SAMPLES);
     }
     pmu_snap_t a, b;
     pmu_read(&a);
-    spdif_decode_ring(&dec, ring, RING_WORDS, cap_end, on_subframe, NULL);
+    spdif_decode_ring(&dec, ring, ring_words, end, on_subframe, NULL);
     pmu_read(&b);
     dec_cycles += b.cycles - a.cycles;
     for (uint32_t i = 0; i < PMU_N_EVENTS; i++) {
         dec_ev[i] += b.ev[i] - a.ev[i];
     }
-    decode_us += micros() - (uint32_t)irq_us;
-    if (state != SPDIF_RX_STATE_NO_SIGNAL && (uint32_t)irq_us - last_block_us > DECODE_TIMEOUT_US) {
+    decode_us += micros() - irq_us;
+    if (state != SPDIF_RX_STATE_NO_SIGNAL && irq_us - last_block_us > DECODE_TIMEOUT_US) {
         lose_signal();
     }
-}
-
-static uint32_t pick_channel(void) {
-    static const uint8_t prefer[] = {6, 5, 2};      // smi_out.c takes 4
-    uint32_t mask = mbox_dma_channels();
-    for (unsigned i = 0; i < sizeof(prefer); i++) {
-        if (mask & (1u << prefer[i])) {
-            return prefer[i];
-        }
-    }
-    return 6;
-}
-
-static void capture_stop(void) {
-    if (dma_ch == 0xFF) {
-        return;
-    }
-    running = false;
-    irq_disable(16u + dma_ch);
-    REG(PCM_CS) = CS_EN | CS_STBY;
-    REG(DMA_CS(dma_ch)) = DMA_CS_RESET;
-    REG(PCM_CS) = 0;
-    pll_out_pcm_clock(SRC_PLLD, 0);
-    REG(GPFSEL2) &= ~(7u << DIN_GPIO_SHIFT);
-}
-
-// Clock and frame master, 64-bit frames of two 32-bit channels, so every PCM clock is one sample.
-// Only the data pin is routed; the clock and frame stay inside the block.
-static void capture_start(void) {
-    if (dma_ch == 0xFF) {
-        dma_ch = pick_channel();
-    }
-    uint32_t ch = dma_ch;
-    capture_stop();
-    pll_out_pcm_clock(SRC_PLLD, PLLD_DIV);
-    REG(GPFSEL2) = (REG(GPFSEL2) & ~(7u << DIN_GPIO_SHIFT)) | (4u << DIN_GPIO_SHIFT);   // ALT0: PCM_DIN
-    REG(PCM_CS) = 0;
-    REG(PCM_CS) = CS_EN | CS_STBY;
-    REG(PCM_MODE) = (63u << 10) | 32u;
-    REG(PCM_RXC) = (1u << 31) | (1u << 30) | (8u << 16) | (1u << 15) | (1u << 14) | (32u << 4) | 8u;
-    REG(PCM_TXC) = 0;
-    REG(PCM_DREQ) = (0x10u << 24) | (0x30u << 16) | (0x30u << 8) | 0x20u;
-    REG(PCM_INTEN) = 0;
-    REG(PCM_CS) = CS_EN | CS_STBY | CS_RXCLR;
-    REG(PCM_CS) = CS_EN | CS_STBY | CS_SYNC;
-    uint32_t t0 = micros();
-    while (!(REG(PCM_CS) & CS_SYNC) && micros() - t0 < 100u) {
-    }
-    REG(PCM_CS) = CS_EN | CS_STBY | CS_RXERR;
-    uint32_t ti = DMA_TI_INTEN | DMA_TI_WAIT_RESP | DMA_TI_DEST_INC | DMA_TI_SRC_DREQ | DMA_TI_PERMAP_PCM_RX |
-                  DMA_TI_NO_WIDE_BURSTS;
-    for (uint32_t i = 0; i < CHUNKS; i++) {
-        cbs[i] = (dma_cb_t){ti, PCM_FIFO_BUS, BUS(&ring[i * CHUNK_WORDS]), CHUNK_BYTES, 0,
-                            BUS(&cbs[(i + 1u) % CHUNKS]), {0, 0}};
-    }
-    data_invalidate(ring, RING_WORDS * 4u);
-    __asm__ volatile("dsb" ::: "memory");
-    spdif_decode_reset(&dec);
-    next_chunk = 0;
-    cap_end = 0;
-    REG(DMA_ENABLE) |= 1u << ch;
-    REG(DMA_CS(ch)) = DMA_CS_RESET;
-    t0 = micros();
-    while (micros() - t0 < 2u) {
-    }
-    REG(DMA_DEBUG(ch)) = 7u;
-    REG(DMA_CONBLK(ch)) = BUS(&cbs[0]);
-    irq_set_handler(16u + ch, dma_irq);
-    irq_enable(16u + ch);
-    running = true;
-    REG(DMA_CS(ch)) = DMA_CS_RUN;
-    REG(PCM_CS) = CS_EN | CS_STBY | CS_DMAEN | CS_RXON;
 }
 
 void spdif_rx_start(const spdif_rx_config_t *config) {
@@ -383,13 +214,17 @@ void spdif_rx_start(const spdif_rx_config_t *config) {
     block_count = 0;
     last_block_us = micros();
     memset(c_bits, 0, sizeof(c_bits));
+    spdif_decode_reset(&dec);
+    cap_end = 0;
+    running = true;
     irq_global_restore(save);
-    capture_start();
+    pcm_capture_start(on_capture);
 }
 
 void spdif_rx_end(void) {
     uint32_t save = irq_global_disable();
-    capture_stop();
+    pcm_capture_stop(on_capture);
+    running = false;
     state = SPDIF_RX_STATE_NO_SIGNAL;
     irq_global_restore(save);
 }
@@ -470,16 +305,18 @@ uint32_t spdif_rx_read_fifo(uint32_t **buff, uint32_t req_count) {
 }
 
 void spdif_rx_pi_status(spdif_rx_pi_status_t *out) {
+    pcm_capture_status_t cs;
+    pcm_capture_status(&cs);
     uint32_t save = irq_global_disable();
     *out = (spdif_rx_pi_status_t){
-        .magic = SPDIF_RX_PI_MAGIC, .running = running, .state = state, .dma_channel = dma_ch,
+        .magic = SPDIF_RX_PI_MAGIC, .running = running, .state = state, .dma_channel = cs.dma_channel,
         .samples_lo = (uint32_t)cap_end, .samples_hi = (uint32_t)(cap_end >> 32), .subframes = dec.subframes,
         .decode_errors = dec.errors, .cell_q8 = dec.cell_q8, .blocks = block_count, .samp_freq = samp_freq,
         .samp_freq_actual_mhz = (uint32_t)(samp_freq_actual * 1000.0f), .parity_errors = parity_err_count,
-        .fifo_used = fifo_used(), .irqs = irqs, .decode_us = decode_us, .pcm_cs = REG(PCM_CS),
-        .dma_debug = dma_ch == 0xFF ? 0 : REG(DMA_DEBUG(dma_ch)) & 7u, .monitor = monitor,
+        .fifo_used = fifo_used(), .irqs = cs.irqs, .decode_us = decode_us, .pcm_cs = cs.pcm_cs,
+        .dma_debug = cs.dma_debug, .monitor = monitor,
     };
-    out->inv_cycles = inv_cycles;
+    out->inv_cycles = cs.inv_cycles;
     out->dec_cycles = dec_cycles;
     out->dec_inst = dec_ev[0];
     out->dec_l1d_refill = dec_ev[2];
@@ -496,8 +333,8 @@ bool spdif_rx_pi_monitor(bool on) {
         return true;
     }
     if (on) {
-        if (running) {
-            return false;   // DSPi's S/PDIF input is using it
+        if (running || pcm_capture_running()) {
+            return false;   // DSPi's S/PDIF or ADAT input is using the capture
         }
         input_arena_claim(INPUT_ARENA_SPDIF);
         spdif_rx_config_t cfg = {.data_pin = 20, .flags = SPDIF_RX_FLAGS_ALL};

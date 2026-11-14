@@ -34,6 +34,7 @@
 #include "i2s_input.h"
 #include "uart.h"
 #include "../z4/i2s_input_pi.h"
+#include "../z4/adat_input_pi.h"
 
 // After the Pi's uart.h: this one renames the SDK's uart_init.
 #include "hardware/uart.h"
@@ -251,7 +252,8 @@ void dma_start_channel_mask(uint32_t chan_mask) {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// PIO: register stand-ins, no state machines. DSPi's I2S receiver on pio2 is z4/i2s_input_pi.c.
+// PIO: register stand-ins, no state machines. DSPi's I2S receiver on pio2 is z4/i2s_input_pi.c, and its
+// ADAT receiver on pio1 SM 2 is z4/adat_input_pi.c.
 
 pio_hw_t pico_shim_pio_hw[3];
 static uint8_t pio_sm_claimed[3];
@@ -280,6 +282,9 @@ static void shim_adat_enable(bool on);
 void pio_sm_set_enabled(PIO pio, uint sm, bool enabled) {
     if (PIO_NUM(pio) == 1u && sm == 1u) {
         shim_adat_enable(enabled);  // the ADAT output's state machine
+    }
+    if (PIO_NUM(pio) == 1u && sm == 2u) {
+        adat_input_pi_enable(enabled);  // the ADAT receiver's
     }
     if (enabled) {
         pio->ctrl |= 1u << sm;
@@ -335,7 +340,10 @@ void pio_sm_drain_tx_fifo(PIO pio, uint sm) {
     (void)pio, (void)sm;
 }
 void pio_sm_exec(PIO pio, uint sm, uint instr) {
-    (void)pio, (void)sm, (void)instr;
+    // The ADAT receiver's `set y, n` is its cell, which sets the rate it reads the line at.
+    if (PIO_NUM(pio) == 1u && sm == 2u && (instr & 0xE0E0u) == 0xE040u) {
+        adat_input_pi_set_y(instr & 0x1Fu);
+    }
 }
 void pio_sm_exec_wait_blocking(PIO pio, uint sm, uint instr) {
     (void)pio, (void)sm, (void)instr;

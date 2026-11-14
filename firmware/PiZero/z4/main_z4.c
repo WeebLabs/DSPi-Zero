@@ -39,6 +39,7 @@
 #include "spdif_input.h"
 #include "dac_hw_mute.h"
 #include "i2s_input.h"
+#include "adat_input.h"
 #include "usb_audio.h"
 
 #include "z4.h"
@@ -48,6 +49,7 @@
 #include "smi_out.h"
 #include "pcm_rx.h"
 #include "i2s_input_pi.h"
+#include "adat_input_pi.h"
 #include "spdif_rx_pi.h"
 #include "cpu_meter.h"
 #include "clk_dump.h"
@@ -736,6 +738,31 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         }
         return true;
     }
+    // 0x52: the ADAT receiver (adat_input_pi.h). IN returns its status; OUT starts its frame reader afresh
+    // with the bench settings (adat_input_pi_bench_t), or with no data stops it.
+    if (bench && req->bRequest == 0x52) {
+        static adat_input_pi_bench_t ab;
+        static adat_input_pi_status_t as;
+        if (in) {
+            if (stage != CONTROL_STAGE_SETUP) {
+                return true;
+            }
+            adat_input_pi_status(&as);
+            return tud_control_xfer(rhport, req, &as, req->wLength < sizeof(as) ? req->wLength : sizeof(as));
+        }
+        if (stage == CONTROL_STAGE_SETUP) {
+            if (req->wLength == 0u) {
+                adat_input_pi_bench(NULL);
+                return tud_control_status(rhport, req);
+            }
+            memset(&ab, 0, sizeof(ab));
+            return tud_control_xfer(rhport, req, &ab, req->wLength < sizeof(ab) ? req->wLength : sizeof(ab));
+        }
+        if (stage == CONTROL_STAGE_DATA) {
+            adat_input_pi_bench(&ab);
+        }
+        return true;
+    }
     // 0x46: PLLA (PiZero_PLLA_plan.md phase 1). OUT wValue 1 retunes to row wIndex, 2 drives the unused
     // PCM clock from source wIndex >> 12 with integer divider wIndex & 0xFFF, 3 starts the frequency
     // counter on mux wIndex & 0xFF for (wIndex >> 8) x 192000 oscillator cycles, 4 puts the SMI on PLLA
@@ -1241,6 +1268,8 @@ static void service_producer(bool lock_gated) {
             (i2s_slave_get_state() == I2S_SLAVE_LOCKED && i2s_input_pi_follower_locked())) {
             i2s_input_poll();
         }
+    } else if (active_input_source == INPUT_SOURCE_ADAT) {
+        adat_input_poll();
     }
     siggen_pump();
     output_rings_idle_pump();

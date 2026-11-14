@@ -39,9 +39,16 @@ typedef struct {
 } dma_hw_t;
 
 extern dma_hw_t pico_shim_dma_hw;
+// adat_input.c is built with dma_hw defined as adat_input_pi_dma_hw(), which brings channel 15's write
+// address up to date before each read (z4/adat_input_pi.h).
+dma_hw_t *adat_input_pi_dma_hw(void);
+#ifndef dma_hw
 #define dma_hw (&pico_shim_dma_hw)
+#endif
 
 #define DMA_CH0_CTRL_TRIG_BUSY_BITS (1u << 26)
+#define DMA_CH0_TRANS_COUNT_MODE_LSB 28u
+#define DMA_CH0_TRANS_COUNT_MODE_VALUE_ENDLESS 0xFu
 
 static inline dma_channel_hw_t *dma_channel_hw_addr(uint channel) {
     return &dma_hw->ch[channel & 15u];

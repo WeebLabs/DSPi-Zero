@@ -1216,3 +1216,42 @@ These checks play audio through the Mac, so they were run with the fix on the tr
 - DSPi measures the master's rate from the ring write address over 32 ms windows and allows 2%. The write address moves once a tick, which alone is up to 1.56% of a window, so a tick held off by 140 us at a window edge would drop the lock. None was seen in the runs.
 - Restarts from presets, bulk parameters, flash writes, clock-mode changes and channel-count changes were not run with I2S as the source. The code follows main.c.
 - DSPi's I2S slave status reports the measured rate from the receiver's word count, as on the RP2350, but its servo commands are ignored while the follower holds PLLA.
+
+## 31. ADAT input
+
+DSPi's `adat_input.c` is compiled unchanged, as `i2s_input.c` and `spdif_input.c` are. On the RP2350 a PIO program turns the line into a decoded bit stream (1 for a level change, MSB first, 32 bits a word) and DMA channel 15 writes it into the arena's 2048-word ADAT ring. DSPi's poll then finds the frame sync, checks every header, unpacks the eight channels and, in slave mode, measures the wire rate for the servo. The Pi produces that same bit stream in that same ring.
+
+- **Capture.** The PCM block's 125 MHz capture of GPIO 20 moved out of `spdif_rx_pi.c` into `z4/pcm_capture_pi.c`. DSPi never runs S/PDIF and ADAT input at once, so whichever receiver is running gets the chunks. One TOSLINK receiver on GPIO 20 serves both. The S/PDIF bench monitor (request 0x44) will not take the capture from a running ADAT input. Capture DMA is now paused and drained before it is reset, as the I2S receiver's is.
+- **Shim.** pio1 SM 2, DSPi's ADAT receiver, starts and stops `z4/adat_input_pi.c`. Its `set y` (`pio_sm_exec`) is the cell, 25 cycles for 48 kHz and 27 for 44.1 kHz, which sets the rate the line is read at. `adat_input.c` is built with `dma_hw` defined as `adat_input_pi_dma_hw()`, so every read of channel 15's write address first brings it up to date.
+- **Main loop.** DSPi's ADAT handling in `main.c` is mirrored in `z4_mainloop.c`: the lock-gated prefill (in slave mode, once the pipeline runs at the wire's rate), the servo, live clock-mode changes, source switches, pin restarts, deferred rate changes and boot into ADAT. The Pi reads GPIO 20 whatever pin DSPi has stored, but DSPi will only start the input with a pin set.
+
+### The decoder
+
+`adat_decode.c` reads the line at the centre of each cell, in groups of 32 cells. A cell is a 1 when its level differs from the cell's before it, which is the PIO program's output. After each group the cell grid moves halfway to the mean of the group's last two edges. Each edge is found by one count of leading zeros over the 32 samples from the centre of the cell before it, as the S/PDIF reader finds its anchors.
+
+- **Two edges, not one.** Consecutive edges rise and fall in turn, so their mean cancels an optical receiver's pulse-width distortion. With one edge a grid settled on one polarity, because a frame is exactly eight groups and the same edges came last in every frame.
+- **A false lock.** Pulse-width distortion also holds a grid whose centres sit on the edges: rising edges then count a cell early and falling ones a cell late, and their errors cancel in the mean. There the two edges come nearly a cell apart instead of twice the distortion, so four groups like that in a row move the grid half a cell, onto the centres.
+- **Margins** (`tests/adat_decode_test.c`, 3000 frames, three seeds, checked from frame 8): clean to ±19 ns of edge jitter at 48 kHz and ±21 ns at 44.1 kHz, or ±16 and ±19 ns of pulse-width distortion with 3 ns of jitter, at clock offsets up to ±1000 ppm. A wrong rate never gives DSPi a lock, as on the RP2350, and a dark line gives zeros at the cell rate.
+- **Cost.** The group loop is ARM assembly (`adat_decode_a32.S`): six instructions a cell with four cells in flight, and the two edges. It costs 6.85% of the core at 48 kHz and 6.3% at 44.1 kHz, from a first version that took 29% by working each gap between edges out, at over 20 instructions an edge. Loads with a negative register offset kept the A53 from issuing two instructions a cycle and cost 30% more; prefetching made no difference.
+- The host test passes its 17 cases on the Mac and, with the assembly, under QEMU, where the assembly must also match the C loop word for word.
+
+### Publishing the words
+
+In slave mode DSPi measures the wire rate from how fast the ring's write index advances over 8 to 16 s, against the system timer. On the RP2350 the index moves every 32 bits; publishing a millisecond chunk at a time would add up to 125 ppm of error. So each decoded word carries where its last cell lies, in samples << 8 (the low 32 bits, so that stamps under 2^31 apart compare by subtraction), and each read of `dma_hw` copies into DSPi's ring the words stamped 2 ms or more before now. The delay outlasts a chunk and its decoding (the least headroom seen is 948 us), so the index moves with the wire. Words that would be overwritten before they are published are given up whole frames at a time, so DSPi keeps its place in the frame, as its own lap guard does.
+
+### Test
+
+`tools/adat_input_check.py` needs a jumper from GPIO 16 (header pin 36, the ADAT output) to GPIO 20 (header pin 38). The ADAT output carries the signal generator at 997 Hz on all eight channels. At each rate DSPi's input goes to ADAT in master mode, and then the clock mode is switched to slave live. The receiver's bench frame reader (request 0x52) checks every frame's header and every sample of all eight channels against the sine. A run fails on any header error, lock loss, wrong sample, publishing overflow or output underrun.
+
+**Results.** Five minutes a case, every frame header and every sample of the eight channels checked:
+
+| Rate | Clock mode | Samples checked | Wrong | Header errors | Lock losses | Overflows | Output underruns | Decoding |
+|---|---|---|---|---|---|---|---|---|
+| 48 kHz | master | 115.2 M | 0 | 0 | 0 | 0 | 0 | 6.85% |
+| 44.1 kHz | master | 105.8 M | 0 | 0 | 0 | 0 | 0 | 6.30% |
+| 44.1 kHz | slave (switched live) | 105.8 M | 0 | 0 | 0 | 0 | 0 | 6.31% |
+
+- **48 kHz slave mode fails, from PLLA, not from the input.** The 48 kHz row is integer-N (NDIV 48, FRAC 0). A trim crossing zero rewrites NDIV and FRAC in two writes (`pll_out.c` `write_multiplier()`), and the clock jumps between them. In the loopback the servo chases its own output, so its trim sits at zero: 8 to 21 lock losses a minute. With 48 kHz moved to the fractional row (A48) for a test, 30 s of slave mode were clean. This is the I2S follower's failure to lock to a master at exactly 48000 Hz (section 30, finding 5). Not changed here.
+- **A loopback must start at its own rate.** A rate change on the switch to ADAT holds the outputs, the ADAT output among them, until the input locks, and a loopback's input can only lock to that output. The tool sets the Pi's USB rate first by playing to it directly.
+- With the input running, the whole core is at 16.7% at 48 kHz with the generator on. The idle load is unchanged, 0.92 to 0.99% against 0.88 to 0.89% for the image before this work.
+- `smi_check.py`, `spdif_cs_check.py`, `mck_check.py`, `adat_check.py --watch 20` and `i2s_input_check.py` (loop, master and ext at 48 kHz, 15 s) passed. **The S/PDIF input was not rechecked** on hardware after its capture moved to `pcm_capture_pi.c`, since `spdif_in_check.py` needs GPIO 20 on an S/PDIF signal (a source, or the GPIO 8 jumper) instead of the ADAT loopback. `adat_check.py` failed once ("ADAT channel 1 differs from slot 0") and passed three times after, as section 30 saw before ADAT input existed.

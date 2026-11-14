@@ -159,6 +159,7 @@ static void pipeline_settle_to_silence(void) {
 }
 
 static bool i2s_prefilling;     // main.c's: the outputs are down while the I2S input fills the rings
+static bool adat_prefilling;    // and while the ADAT input does
 
 static void prepare_pipeline_reset(uint32_t mute_samples) {
     pipeline_settle_to_silence();
@@ -169,7 +170,8 @@ static void prepare_pipeline_reset(uint32_t mute_samples) {
     }
     preset_mute_counter = mute_samples;
     preset_loading = true;
-    i2s_prefilling = false;     // the handshake starts again from preset_loading once this operation ends
+    i2s_prefilling = false;     // the handshakes start again from preset_loading once this operation ends
+    adat_prefilling = false;
     __dmb();
     pipeline_clear_soft_mute_request();
     pipeline_fade_reset();
@@ -392,6 +394,36 @@ static void service_i2s_input(void) {
     } else if (i2s_prefilling && !i2s_input_is_clock_master()) {
         i2s_input_prefill_silence(output_ring_block_cap);
     }
+}
+
+// main.c's ADAT part of input_service_handshakes(), S/PDIF's flow in both clock modes: on lock (and in
+// slave mode once the pipeline runs at the wire's rate), drain the outputs and prefill them from the
+// input; on loss, mute. No receiver restart is needed: the poll finds the frame sync again by itself.
+static void service_adat_input(void) {
+    if (active_input_source != INPUT_SOURCE_ADAT) {
+        adat_prefilling = false;
+        return;
+    }
+    AdatInputState ad_state = adat_input_get_state();
+    if (ad_state == ADAT_INPUT_LOCKED && preset_loading && !adat_prefilling && dac_hw_mute_hold_elapsed()) {
+        if (!adat_input_check_rate_change()) {
+            drain_and_disable_outputs();
+            preset_loading = false;
+            preset_mute_counter = 0;
+            adat_prefilling = true;
+            adat_input_discard_queued();
+        }
+    }
+    if (adat_prefilling && ad_state == ADAT_INPUT_LOCKED && slot_fill_at_target(0)) {
+        enable_outputs_in_sync();
+        adat_prefilling = false;
+        dac_hw_mute_release();
+    }
+    if (ad_state == ADAT_INPUT_RELOCKING && !preset_loading) {
+        prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+        pipeline_reset_cpu_metering();
+    }
+    adat_input_update_clock_servo();
 }
 
 // main.c's flash write bracket. Flash is RAM here, so only the I2S input is suspended, as main.c does.
@@ -1313,11 +1345,29 @@ static void service_input_config(void) {
             notify_param_write(offsetof(WireBulkParams, input_config.i2s_clock_mode), 1, &wire_mode);
         }
     }
+    // An ADAT clock mode change restarts the receiver in its new mode while ADAT is the source; the
+    // outputs need no rebuild, since the receiver only receives.
     if (adat_clock_mode_change_pending) {
-        adat_clock_mode_change_pending = false;
-        __dmb();
-        if (pending_adat_clock_mode != adat_clock_mode) {
+        if (active_input_source != INPUT_SOURCE_ADAT || pending_adat_clock_mode == adat_clock_mode) {
+            adat_clock_mode_change_pending = false;
+            __dmb();
+            if (pending_adat_clock_mode != adat_clock_mode) {
+                adat_clock_mode = pending_adat_clock_mode;
+                uint8_t wire_mode_p1 = (uint8_t)(adat_clock_mode + 1);
+                notify_param_write(offsetof(WireBulkParams, input_config.adat_clock_mode_p1), 1, &wire_mode_p1);
+            }
+        } else if (pipeline_reset_ready()) {
+            adat_clock_mode_change_pending = false;
+            __dmb();
+            prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+            adat_input_stop();
             adat_clock_mode = pending_adat_clock_mode;
+            if (adat_clock_mode == ADAT_CLOCK_MODE_SLAVE) {
+                rate_change_pending = false;    // the wire's rate is found after lock
+            } else if (i2s_input_rate != audio_state.freq) {
+                perform_rate_change(i2s_input_rate, true);
+            }
+            adat_input_start();
             uint8_t wire_mode_p1 = (uint8_t)(adat_clock_mode + 1);
             notify_param_write(offsetof(WireBulkParams, input_config.adat_clock_mode_p1), 1, &wire_mode_p1);
         }
@@ -1344,6 +1394,7 @@ static void service_input_config(void) {
                 }
             } else if (old_source == INPUT_SOURCE_ADAT) {
                 adat_input_stop();
+                adat_prefilling = false;
             }
             if (old_source != INPUT_SOURCE_USB) {
                 leveller_reset_pending = true;
@@ -1377,8 +1428,10 @@ static void service_input_config(void) {
             } else if (new_source == INPUT_SOURCE_I2S) {
                 i2s_input_bringup_prefill();
             } else if (new_source == INPUT_SOURCE_ADAT) {
+                // In master mode ADAT shares the I2S input's rate; in slave mode the wire's rate is found
+                // after lock. The ADAT block prefills, starts the outputs and releases the mute.
                 if (adat_clock_mode == ADAT_CLOCK_MODE_MASTER && i2s_input_rate != audio_state.freq) {
-                    perform_rate_change(i2s_input_rate, false);   // the stand-in never prefills
+                    perform_rate_change(i2s_input_rate, true);
                 }
                 adat_input_start();
             } else {
@@ -1399,7 +1452,18 @@ static void service_input_config(void) {
     // Receiver pins stay where the Pi has them, but a changed I2S channel count needs a restart, which
     // main.c also makes for a moved pin.
     spdif_rx_pin_change_pending = false;
-    adat_input_restart_pending = false;
+    // A new ADAT pin restarts the receiver, as in main.c, though GPIO 20 is read whatever it says; the
+    // restart matters for a pin set from none, since adat_input.c will not start without one.
+    if (adat_input_restart_pending) {
+        adat_input_restart_pending = false;
+        if (active_input_source == INPUT_SOURCE_ADAT) {
+            pipeline_settle_to_silence();
+            adat_input_stop();
+            adat_prefilling = false;
+            prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+            adat_input_start();
+        }
+    }
     if ((i2s_rx_pin_change_pending || i2s_input_restart_pending) && pipeline_reset_ready()) {
         i2s_rx_pin_change_pending = false;
         i2s_input_restart_pending = false;
@@ -1423,6 +1487,7 @@ void z4_dspi_service(void) {
     dac_hw_mute_tick();
     service_spdif_input();
     service_i2s_input();
+    service_adat_input();
     lg_sound_sync_tick();
     siggen_service();
     rta_service();
@@ -1443,8 +1508,8 @@ void z4_dspi_service(void) {
             r = z4_host_rate();
         }
         if (r != audio_state.freq) {
-            // For an I2S input the prefill restarts the outputs and releases the mute, as in main.c.
-            perform_rate_change(r, active_input_source == INPUT_SOURCE_I2S);
+            // For an I2S or ADAT input the prefill restarts the outputs and releases the mute, as in main.c.
+            perform_rate_change(r, active_input_source == INPUT_SOURCE_I2S || active_input_source == INPUT_SOURCE_ADAT);
         }
     }
 
@@ -1518,6 +1583,10 @@ void z4_dspi_init(void) {
         i2s_input_bringup_prefill();
     } else if (active_input_source == INPUT_SOURCE_ADAT) {
         prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+        if (adat_clock_mode == ADAT_CLOCK_MODE_MASTER && i2s_input_rate != audio_state.freq) {
+            perform_rate_change(i2s_input_rate, true);
+            dsp_update_delay_samples((float)i2s_input_rate);
+        }
         adat_input_start();
     }
 

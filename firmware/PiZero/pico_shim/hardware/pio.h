@@ -98,6 +98,9 @@ static inline void sm_config_set_clkdiv_int_frac(pio_sm_config *c, uint16_t div_
 static inline uint pio_encode_set(enum pio_src_dest dest, uint value) {
     return 0xe000u | ((uint)dest << 5) | (value & 0x1fu);
 }
+static inline uint pio_encode_mov_not(enum pio_src_dest dest, enum pio_src_dest src) {
+    return 0xa008u | ((uint)dest << 5) | ((uint)src & 7u);
+}
 static inline uint pio_encode_jmp(uint addr) {
     return addr & 0x1fu;
 }
