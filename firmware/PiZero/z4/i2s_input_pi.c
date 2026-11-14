@@ -58,6 +58,7 @@
 #define TICK_US 500u            // short decode bursts disturb the capture least
 #define WARM_US 2000u           // how long before a reload the control block is read, once a tick
 #define CAL_WORDS (1u << 15)    // the calibration run (1-2 ms): snapshot rate and the external BCK
+#define BLOCK (I2S_RX_SCAN_SAMPLES * 4u)   // bytes decoded between cache drops, whole lines and 2048 snapshots
 #define PHASE_SAMPLES 2048u     // snapshots the clock follower looks at
 #define PHASE_EVERY 4u          // on one tick in this many
 #define RING_WORDS INPUT_ARENA_I2S_WORDS
@@ -269,27 +270,38 @@ static void keep_dump(const uint32_t *end) {
     }
 }
 
+// Decodes the snapshots of [from, from + bytes) a block at a time and drops each block's lines from the
+// cache again once it is decoded. Left in, the stream fills the L2 within 4 ms and pushes DSPi's dirty
+// data out of it; the main loop's refills then write that data back all over SDRAM, and such scattered
+// write-backs are what stalled the capture at 96 kHz.
 static void decode_part(uint32_t from, uint32_t bytes) {
     const uint32_t *p = &cap[from / 4u];
-    invalidate(p, bytes);
-    uint32_t c0 = pmu_cycles();
-    i2s_rx_decode(&dec, p, bytes / 4u);
-    dec_cycles += pmu_cycles() - c0;
-    if (bench.flags & I2S_INPUT_PI_HIST) {
-        count_rises(p, bytes / 4u);
-    }
-    if (dec.bad_edge) {
-        keep_dump(p + bytes / 4u);
-    }
-    if (dec.rescued_at) {
-        st.rescued_when[dec.rescued_at > p ? (uint32_t)(dec.rescued_at - p) * 16u / (bytes / 4u) : 0u]++;
-        dec.rescued_at = 0;
+    bool measure = st.role == 3u && st.ticks % PHASE_EVERY == 0u;
+    for (uint32_t off = 0; off < bytes; off += BLOCK) {
+        uint32_t len = bytes - off < BLOCK ? bytes - off : BLOCK, n = len / 4u;
+        const uint32_t *q = p + off / 4u;
+        invalidate(q, len);     // whatever the prefetcher or a look back brought in since the last lap
+        uint32_t c0 = pmu_cycles();
+        i2s_rx_decode(&dec, q, n);
+        dec_cycles += pmu_cycles() - c0;
+        if (bench.flags & I2S_INPUT_PI_HIST) {
+            count_rises(q, n);
+        }
+        if (dec.bad_edge) {
+            keep_dump(q + n);
+        }
+        if (dec.rescued_at) {
+            st.rescued_when[dec.rescued_at > p ? (uint32_t)(dec.rescued_at - p) * 16u / (bytes / 4u) : 0u]++;
+            dec.rescued_at = 0;
+        }
+        if (measure && off == 0u) {
+            measure_phase(q, n < PHASE_SAMPLES ? n : PHASE_SAMPLES);
+        }
+        if (!(bench.flags & I2S_INPUT_PI_KEEP_LINES)) {
+            invalidate(q, len);
+        }
     }
     samples += bytes / 4u;
-    if (st.role == 3u && st.ticks % PHASE_EVERY == 0u) {
-        uint32_t n = bytes / 4u;
-        measure_phase(p, n < PHASE_SAMPLES ? n : PHASE_SAMPLES);
-    }
 }
 
 static void set_sample_ns(float ns) {

@@ -1103,7 +1103,7 @@ The producer polls the input, lock-gated in the main loop as main.c does, and wi
 | 96 kHz | master | 0 | 0 | framing only | | 291 | 0 | 0 | 0 |
 | 96 kHz | ext, +40 ppm | 0 | 0 | 57.6 M | 0 | 0 | 0 | 0 | 0 |
 
-**96 kHz is not safe yet, though these runs are clean.** At 44.1 and 48 kHz, with the wide bursts, the capture lost no BCK rise in any run of any image, the added write load included. At 96 kHz it stalls for two to five snapshots (65 to 160 ns) and a rise goes unseen. A bit clock is 163 ns there. The decoder puts a lost rise back when the spacing of the rises shows where it was (a stall put right), and in the loop and ext cases every word that came out of that was right. When the stall is near a whole bit clock nothing shows where the bit went. The result is then a concealed frame or a bit put back wrongly with no counter raised. How often the capture stalls depends on the image, for a reason that was not found (below). Three earlier images of nearly the same code failed their 5-minute runs at 96 kHz:
+**96 kHz was not safe at this point, though these runs are clean.** The cause was found afterwards and is described with its fix further down. At 44.1 and 48 kHz, with the wide bursts, the capture lost no BCK rise in any run of any image, the added write load included. At 96 kHz it stalls for two to five snapshots (65 to 160 ns) and a rise goes unseen. A bit clock is 163 ns there. The decoder puts a lost rise back when the spacing of the rises shows where it was (a stall put right), and in the loop and ext cases every word that came out of that was right. When the stall is near a whole bit clock nothing shows where the bit went. The result is then a concealed frame or a bit put back wrongly with no counter raised. How often the capture stalls depends on the image, for a reason that was not found (below). Three earlier images of nearly the same code failed their 5-minute runs at 96 kHz:
 - One had 610 stalls put right in the loop case and 12 wrong words with no concealed frame.
 - One had 605 in the loop case with 1 concealed frame and 36 wrong words, and 1125 in the master case with 2 concealed frames.
 - One, with the same layout as the final image, lost a frame to the decoder fault at the reload described under the fixes, which is now gone.
@@ -1137,7 +1137,7 @@ So the final image is clean at 96 kHz because its layout happens to stall rarely
 - The capture's control block had the no-wide-bursts bit set, which makes each 128-bit write two transfers. Without the bit a stall long enough to lose a rise was 3 to 50 times rarer in every pair of runs, and the stalls that remain are shorter, so nearly all of them can be put right. 48 kHz stayed clean under a write load that lost 2359 rises before. The receiver now leaves the bit clear, in the calibration run as well.
 - The composer's uncached stores are not the main cause. With the SMI ring mapped cached and written back by cache line, the stall counts did not change and the composer cost 383 cycles a frame against 325 to 355. That change was taken out again.
 - The stalls come while the main loop and the other interrupts run, not during the tick. In 5-minute runs without the counting, 7 of 426 stalls put right fell in the first two sixteenths of the tick's snapshots, which is when the tick interrupt itself runs, and 84 fell in the two after it. An even spread would put 53 in each pair.
-- The stall rate depends on the image far more than on anything else tried, and what decides it was not found. Images that differ by a few instructions or a few bytes of state give 0 to 4 stalls a second, differently for each role, and reloading the same image gives the same rates again. The table gives stalls put right a minute at 96 kHz, from runs of 30 s to 5 minutes. None of these explains it.
+- The stall rate depends on the image far more than on anything else tried in the audit, which did not find what decides it (it is the cache, see the cause below). Images that differ by a few instructions or a few bytes of state give 0 to 4 stalls a second, differently for each role, and reloading the same image gives the same rates again. The table gives stalls put right a minute at 96 kHz, from runs of 30 s to 5 minutes. None of these explains it.
 
 | Image | Loop | Master | Ext |
 |---|---|---|---|
@@ -1152,8 +1152,8 @@ So the final image is clean at 96 kHz because its layout happens to stall rarely
 | The decoder's two assembly routines on 64-byte boundaries (kept) | 1 | 61 | 0 |
 
 - In one image, reading the code buffer before the scan wrote it, the scan block at 512 snapshots, and PLLA trimmed by 0, 30 and 200 ppm made no difference. The rates of L2 write-backs and of write streaming (PMU events 0x18, 0xC4 and 0xC5) differed by less than half between a case with no stalls and one with 4 a second.
-- The two assembly routines of the decoder now start on 64-byte boundaries, as the composer's and the S/PDIF decoder's already did. That gave the best image measured, but it is one more layout, not a cure: any later change to the code may move the rates again.
-- Not tried: the tick or the composer on another core, a shorter tick, a second capture channel offset from the first, and turning off the Cortex-A53's write streaming in CPUACTLR (the access may trap in the firmware's monitor, which would hang the board).
+- The two assembly routines of the decoder now start on 64-byte boundaries, as the composer's and the S/PDIF decoder's already did. That gave the best image measured in the audit. It is one more layout and not a cure, and with the fix below it no longer matters for the stalls.
+- Not tried in the audit: the tick or the composer on another core, a shorter tick and a second capture channel offset from the first. Reading CPUACTLR to turn off the Cortex-A53's write streaming was tried later and hung the board, although the undefined-instruction vector was set to return from such a trap and HACTLR allowed the access. So the register traps above PL1 under the stock boot stub and cannot be used.
 
 **The hangs, and the DMA abort.** The board stopped answering twice during the audit, each time straight after the input source went from I2S back to USB. It stayed enumerated, timed out every control request and needed a power cycle. The first time was on an image with the experiments in it, the second on the plain build. `stop()` reset the capture channel while it was mid-transfer, and both hangs came on images with the wide bursts. Every reset of a channel that may be active now pauses it first, waits for its outstanding writes (CS bit 6) and only then resets, as Linux's `bcm2835_dma_abort()` does. With that, 170 switches from I2S back to USB passed with no hang, 40 of them on the final image: master and ext roles at the three rates, with rate changes while the input ran, and 53 of them with MCK on. The hang was not reproduced on purpose without the change, since each try needs a power cycle, so the abort is the likely cure and not a proven one.
 
@@ -1171,6 +1171,41 @@ So the final image is clean at 96 kHz because its layout happens to stall rarely
 **The other checks on the final image.** `smi_check.py`, `spdif_cs_check.py`, `mck_check.py`, `adat_check.py --watch 20` and `spdif_in_check.py --source --watch 20` passed after the runs above. The idle load was 0.97 to 1.05% at 48 kHz, and `usb_health.py` showed no dropped event and one gap of 20 ms between `tud_task()` calls since boot. The decoder test passes its 37 cases on the Mac and under QEMU with the assembly.
 
 **The decoder test passes by its random sequence.** A new case put before the others changed the sequence the later cases draw from. The case "96 kHz, stalls 145 ns, tco 6 ns" then gave 8 wrong words outside concealed frames, which its own rule (nothing silent) forbids, and one round of the fast-against-plain comparison differed. The first is the decoder's limit at stalls near a whole bit clock, as on the board. The second may be the test's own doing, since it refills one buffer while the fast path still holds codes scanned from it, but that was not confirmed. Neither was changed. The new case sits last so that the suite keeps its sequences.
+
+**The cause of the 96 kHz stalls, and the fix (2026-11-13, after the audit above).** The decoded snapshots were left in the ARM's cache. At 96 kHz the tick reads 62 KB of them every 500 us, so the stream ran through the whole 512 KB L2 about every 4 ms and kept pushing DSPi's working data out of it. Whenever the main loop came back to that data, each refill threw out another line, and a line that was dirty was written back to SDRAM at an address unrelated to the last one. Such scattered write-backs are what stall the capture DMA. How many of DSPi's dirty lines are thrown out depends on which lines share L2 sets, so every change to the code or data layout moved the stall rate, and each role, with its own working set, had its own rate.
+
+The receiver now decodes 8 KB of snapshots at a time and drops those lines from the cache as soon as they are decoded (`decode_part()` in `z4/i2s_input_pi.c`). The stream then never holds more than 8 KB of the cache, and its lines free their places for the next block. The bench flag `--keep-lines` leaves the lines in, which is the old behaviour.
+
+What shows it, each within one image:
+
+| Test, 96 kHz | Stalls put right |
+|---|---|
+| Lines kept, then dropped, then kept, then dropped: loop, 15 s each | 10, 0, 7, 0 |
+| The same in the master case | 34, 0, 19, 0 |
+| Lines kept, all three roles, 20 s each | 3, 80, 36 |
+| Lines dropped, all three roles, 20 s each, before and after that | 0, 0, 0 and 0, 0, 0 |
+| Master, lines kept, the input not polled, so that DSPi processes nothing | 1 in 15 s, against 6 to 14 |
+| Main loop also writing 32 KB a pass in order, to one buffer or through 8 MB of far memory (loop, lines kept) | 6 and 14 to 17 in 12 s, against 14 to 18 |
+| Main loop also writing 32 KB a pass to random places in a 64 KB buffer, which stays cached | 16 |
+| Main loop also reading 512 random lines of 8 MB of far memory a pass | 20 |
+| Main loop also writing one word to each of 512 random lines of that memory a pass | 8366, and 37260 frames concealed |
+
+- Only writes that come back out of the cache at scattered addresses stall the capture. Writes in address order, writes that stay cached and reads do not. Why the scattered ones do was not taken further: it is in how the SDRAM controller serves them.
+- With the lines dropped, decoding takes 1201 cycles a frame against 1232, since the stream no longer spills from the L1 into the L2, and the whole load rises by 0.45% of the core for the second pass of invalidations.
+- The lines are still invalidated before they are read as well. The prefetcher reads a few lines past the end of each block, and those hold the last lap's snapshots.
+
+**Proof against the layout.** Each image below was first run for 20 s a role with the lines kept, which shows that its layout has the stalls, and then for 5 minutes a role with the fix. Every 5-minute run had no stall put right, no bad half, no concealed frame, no wrong word (230.4 M checked in each loop run, 57.6 M in each ext run), no slip, no restart and no output underrun.
+
+| Image | Lines kept, 20 s: loop, master, ext | Fix, 5 min: loop, master, ext |
+|---|---|---|
+| The tree without the 64-byte alignment of the decoder's assembly | 3, 6, 22 | 0, 0, 0 |
+| Every function on a 64-byte boundary (`-falign-functions=64`) | 4, 9, 1 | 0, 0, 0 |
+| Five more words in the decoder's state and an unused branch in its set-up | 50, 62, 77 | 0, 0, 0 |
+| The final tree | 72, 60 with one frame concealed, 65 | 0, 0, 0 |
+
+**44.1 and 48 kHz and the other checks on the final image.** On the final image, 5 minutes a role, the loop, master and ext cases at 44.1 kHz and at 48 kHz all passed with no stall put right, no bad half, no concealed frame, no wrong word (105.8 M and 26.5 M checked at 44.1 kHz, 115.2 M and 28.8 M at 48 kHz), no slip, no restart and no output underrun. Twenty-five more switches from I2S back to USB, 9 of them with MCK on, passed with no hang. `smi_check.py`, `spdif_cs_check.py`, `mck_check.py` and `spdif_in_check.py --source --watch 20` passed. `adat_check.py --watch 20` failed once, straight after the image was loaded ("ADAT channel 1 differs from slot 0"), and passed three times after that; the I2S receiver does not run during it, and the failure was not looked into. The idle load at 48 kHz is 0.88 to 0.89%, and `usb_health.py` showed no dropped event. The decoder is unchanged, and its test passes its 37 cases on the Mac and under QEMU.
+
+These checks play audio through the Mac, so they were run with the fix on the tree of commit 7d165cd. The two later commits change the USB descriptors, and with them the Mac lists the board with no output channels, so the tools find no device to play to. The 5-minute runs of the final tree above do not use USB audio and were made with those commits in the tree.
 
 **Not covered.**
 - No real external master, source or DAC has been connected. The external master is the PCM block, on the Pi's own crystal, so a real master's drift and jitter are untested.

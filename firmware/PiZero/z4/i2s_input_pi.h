@@ -32,6 +32,7 @@ bool i2s_input_pi_follower_locked(void);    // external clock: the SMI's clocks 
 enum {
     I2S_INPUT_PI_PCM_MASTER = 1u << 0,      // the PCM block plays a sine as a master on GPIO 18, 19, 21
     I2S_INPUT_PI_HIST = 1u << 1,            // count the snapshots between BCK rises (status hist[])
+    I2S_INPUT_PI_KEEP_LINES = 1u << 2,      // leave the decoded snapshots in the cache, as before the fix
 };
 typedef struct {
     uint8_t shift, data, ext_bck;           // snapshot window base, data line 0, external BCK

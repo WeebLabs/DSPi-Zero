@@ -37,7 +37,7 @@ REQ_SET_I2S_CLOCK_MODE, REQ_GET_I2S_CLOCK_MODE, REQ_GET_I2S_SLAVE_STATUS = 0x88,
 REQ_GET_STATUS = 0x50
 REQ_SET_OUTPUT_ENABLE, REQ_GET_OUTPUT_ENABLE = 0x72, 0x73
 REQ_SIGGEN_SET_CONFIG, REQ_SIGGEN_CONTROL = 0xA4, 0xA6
-PCM_MASTER, HIST = 1, 2
+PCM_MASTER, HIST, KEEP_LINES = 1, 2, 4
 EXTRA_FLAGS = 0     # --hist: every bench request also asks for the rise-distance histogram
 
 FIELDS = ("magic running role waits dma_channel warm_channel pairs ext_bck_hz sample_ps ticks skipped overruns "
@@ -301,10 +301,12 @@ def main():
     ap.add_argument("--ext-rate", type=int, default=44100)
     ap.add_argument("--ext-ppm", type=float, default=40.0)
     ap.add_argument("--seconds", type=int, default=20)
+    ap.add_argument("--keep-lines", action="store_true",
+                    help="leave decoded snapshots in the cache, which brings the 96 kHz capture stalls back")
     ap.add_argument("--hist", action="store_true", help="count the snapshots between BCK rises (costs CPU)")
     args = ap.parse_args()
     global EXTRA_FLAGS
-    EXTRA_FLAGS = HIST if args.hist else 0
+    EXTRA_FLAGS = (HIST if args.hist else 0) | (KEEP_LINES if args.keep_lines else 0)
     dev = find_board()
     if dev is None:
         raise SystemExit("FAIL: no DSPi Zero")
