@@ -3,8 +3,9 @@
 between rows b48 and b44. The firmware counts the SMI clock in back-to-back 1 ms windows and moves PLLA at
 the start of the third (bench request 0x46 op 5), so the main loop stalls for the capture.
 
-Usage: python3.14 firmware/PiZero/tools/pll_settle.py [--windows N] [--repeat N]
-Puts the SMI on PLLA first and leaves PLLA on b48 at the end.
+Usage: python3.14 firmware/PiZero/tools/pll_settle.py [--windows N] [--repeat N] [--rows 4,3]
+Puts the SMI on PLLA first and leaves PLLA on b48 at the end. With --rows 5 it captures the move from b48
+to c48, the 48 kHz row used while PLLA is trimmed; the firmware goes back to b48 after each capture.
 """
 import argparse
 import struct
@@ -16,7 +17,7 @@ import pll_check as p
 import smi_pll_check as q
 
 XOSC = 19.2e6
-ROW_VCO = {3: 1843.2e6, 4: 1693.44e6}     # b48, b44
+ROW_VCO = {3: 1843.2e6, 4: 1693.44e6, 5: 2211.84e6}     # b48, b44, c48
 
 
 def capture(dev, row, n):
@@ -64,6 +65,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--windows", type=int, default=24)
     ap.add_argument("--repeat", type=int, default=3)
+    ap.add_argument("--rows", default="4,3")
     args = ap.parse_args()
     dev = find_board()
     if dev is None:
@@ -75,8 +77,9 @@ def main():
         return 1
     worst = 0
     for _ in range(args.repeat):
-        for row in (4, 3):
+        for row in [int(r) for r in args.rows.split(",")]:
             t = show(dev, row, args.windows)
+            time.sleep(0.1)
             worst = max(worst, 10**9 if t is None else t)
     print(f"worst settling: {worst / 1000:.1f} ms" if worst < 10**9 else "FAIL: did not settle")
     return 0 if worst < 10**9 else 1

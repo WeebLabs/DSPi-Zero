@@ -12,6 +12,7 @@ enum {
     PLL_ROW_A44,            // 2167.6032 MHz, PER /8 = 270.9504 MHz
     PLL_ROW_B48,            // 1843.2 MHz integer-N, PER /5 = 368.64 MHz
     PLL_ROW_B44,            // 1693.44 MHz, PER /5 = 338.688 MHz
+    PLL_ROW_C48,            // 2211.84 MHz (N 57.6), PER /5 = 442.368 MHz: 48 kHz while PLLA is trimmed
     PLL_ROW_COUNT,
 };
 
@@ -46,11 +47,16 @@ typedef struct {
 // SMI on PLLA. pll_out_smi_row() picks the row and CM_SMI divider for a rate, or returns PLL_ROW_COUNT.
 bool pll_out_select(uint32_t row);
 uint32_t pll_out_smi_row(uint32_t freq, uint32_t *divi);
-void pll_out_set_in_use(bool on);
-void pll_out_trim(int32_t ppb);
+void pll_out_set_in_use(bool on);       // the SMI runs from plla_per: bench moves that hold it are refused
+void pll_out_trim(int32_t ppb);         // live trim of the multiplier, kept across family moves
+// While a servo or the clock follower owns the trim, or the trim is not zero, the 48 kHz family runs
+// from C48 and not the integer row, which is never trimmed. pll_out_reselect() is true when the SMI
+// runs from the other 48 kHz row and should pick its row again.
+void pll_out_set_tracked(bool on);
+bool pll_out_reselect(void);
 enum { PLL_WD_OK, PLL_WD_RESTORED, PLL_WD_FALLBACK };
 uint32_t pll_out_watchdog(void);    // main loop; on PLL_WD_FALLBACK the caller moves the SMI to PLLD
-void pll_out_sabotage(uint32_t ms); // bench: rewrite PLLA as the firmware would, once or for ms     // live trim of every row's multiplier, kept across family moves                   // the SMI runs from plla_per: bench moves that hold it are refused
+void pll_out_sabotage(uint32_t ms); // bench: rewrite PLLA as the firmware would, once or for ms
 
 // Settling capture: the SMI clock counted in back-to-back 1 ms windows, with PLLA moved to a row at the
 // start of window PLL_CAPTURE_PRE. Bench only: it blocks the main loop for the whole capture.

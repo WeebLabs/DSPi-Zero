@@ -24,6 +24,7 @@ void i2s_input_pi_clear_slip(void);
 
 void i2s_input_pi_poll(void);               // main loop: the clock follower and bench requests
 bool i2s_input_pi_running(void);            // the capture is on (VideoCore mailbox calls must wait)
+bool soft_vcxo_pi_tracking(void);           // soft_vcxo_pi.c: an input's servo or the follower owns the trim
 bool i2s_input_pi_owns_pll(void);           // external clock: PLLA's trim belongs to the follower
 bool i2s_input_pi_follower_locked(void);    // external clock: the SMI's clocks follow the master's
 

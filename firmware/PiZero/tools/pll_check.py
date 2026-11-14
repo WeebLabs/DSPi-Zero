@@ -3,7 +3,7 @@
 clock from plla_per with an integer divider, and read it back with the clock manager's frequency counter.
 Nothing audible uses PLLA in this phase; the SMI stays on PLLD.
 
-Usage: python3.14 firmware/PiZero/tools/pll_check.py [--rows a48,a44,b48,b44] [--leave a48] [--soak SECONDS]
+Usage: python3.14 firmware/PiZero/tools/pll_check.py [--rows a48,a44,b48,b44,c48] [--leave a48] [--soak SECONDS]
 --leave picks the row left running at the end (default: the firmware's values). --soak then checks the
 registers, lock bit and counter once a second for that long.
 """
@@ -23,7 +23,7 @@ FIELDS = ("magic row state retunes lock_us unlock_first_us unlock_reads lock_rea
           "wd_cm gp0_ctl gp0_div gpfsel0 gpfsel1").split()
 # name: (row index, NDIV, FRAC, PER divider, PCM divider giving 768 fs at 48 or 44.1 kHz)
 ROWS = {"fw": (0, None, None, None, None), "a48": (1, 61, 0x70A3D, 8, 8), "a44": (2, 56, 0x72B02, 8, 8),
-        "b48": (3, 48, 0, 5, 10), "b44": (4, 44, 0x1999A, 5, 10)}
+        "b48": (3, 48, 0, 5, 10), "b44": (4, 44, 0x1999A, 5, 10), "c48": (5, 57, 0x9999A, 5, 12)}
 STATES = ["idle", "waiting", "locked", "TIMEOUT"]
 
 
@@ -139,7 +139,7 @@ def soak(dev, name, seconds):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rows", default="a48,a44,b48,b44")
+    ap.add_argument("--rows", default="a48,a44,b48,b44,c48")
     ap.add_argument("--leave", default="fw")
     ap.add_argument("--soak", type=float, default=0)
     args = ap.parse_args()

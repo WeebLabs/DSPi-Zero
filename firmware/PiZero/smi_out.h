@@ -34,6 +34,7 @@ typedef struct {
 // composing as it goes.
 bool smi_out_start(uint16_t *ring, uint32_t ring_frames, uint32_t freq, uint32_t pin_mask, smi_compose_fn compose);
 void smi_out_set_rate(uint32_t freq);
+void smi_out_reclock(void);     // sets the clock up again at the same rate, after PLLA's row choice changed
 
 // Clock source. PLLA gives an integer divider (PiZero_PLLA_plan.md) at rates it covers; any other rate,
 // or a PLLA that does not lock, falls back to PLLD with MASH. smi_out_source() reports the one in use.

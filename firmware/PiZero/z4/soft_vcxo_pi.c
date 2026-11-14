@@ -6,6 +6,7 @@
 #include <math.h>
 
 #include "soft_vcxo.h"
+#include "audio_input.h"
 #include "audio_clock_div.h"
 #include "usb_audio.h"
 #include "pll_out.h"
@@ -34,6 +35,12 @@ void soft_vcxo_set_ppm(float ppm) {
         trim = ppm + (rp - 1.0f) * 1e6f;
     }
     pll_out_trim((int32_t)lrintf(trim * 1000.0f));
+}
+
+// True while an input owns the trim: the S/PDIF servo, or ADAT or I2S in slave mode. PLLA then keeps
+// off its integer row (pll_out_set_tracked()), whatever the trim is at the moment.
+bool soft_vcxo_pi_tracking(void) {
+    return input_source_is_spdif(active_input_source) || adat_slave_mode_active() || i2s_slave_mode_active();
 }
 
 float soft_vcxo_current_ppm(void) {

@@ -55,6 +55,7 @@ static const row_t rows[PLL_ROW_COUNT] = {
     [PLL_ROW_A44] = {56, 0x72B02, 8},
     [PLL_ROW_B48] = {48, 0x00000, 5},
     [PLL_ROW_B44] = {44, 0x1999A, 5},
+    [PLL_ROW_C48] = {57, 0x9999A, 5},
 };
 
 static pll_out_status_t st = {.magic = PLL_OUT_MAGIC, .unlock_first_us = 0xFFFFFFFFu};
@@ -63,7 +64,8 @@ static volatile uint32_t pending_row = 0xFFFFFFFFu;
 static volatile uint32_t pending_mux = 0xFFFFFFFFu, pending_osc;
 static uint32_t write_us, count_start_us;
 static const row_t *active;
-static int32_t trim_ppb;     // applied to every row, kept across family moves
+static int32_t trim_ppb;     // applied to every fractional row, kept across family moves
+static bool tracked;         // a servo or the clock follower owns the trim
 static volatile uint32_t pending_capture = 0xFFFFFFFFu;
 static pll_out_capture_t cap;
 
@@ -90,23 +92,36 @@ static void save_firmware_values(void) {
     st.fw_cm_plla = rd(CM_PLLA);
 }
 
-// Moves NDIV and FRAC so the VCO never passes above the higher of the old and new values. CTRL is
-// written last either way, in case FRAC only takes effect on a CTRL write.
+// FRAC and NDIV each take effect as they are written (bring-up section 32), so a move that changes NDIV
+// passes through a multiplier up to one off and the clock jumps. A trim never changes NDIV. The order
+// keeps the VCO at or below the higher of the old and new values.
 static void write_multiplier(uint32_t ndiv, uint32_t frac) {
     uint32_t ctrl = rd(A2W_PLLA_CTRL);
     uint64_t cur = (uint64_t)(ctrl & NDIV_MASK) << 20 | (rd(A2W_PLLA_FRAC) & FRAC_MASK);
     uint64_t tgt = (uint64_t)ndiv << 20 | frac;
+    if ((ctrl & NDIV_MASK) == ndiv) {
+        if (tgt != cur) {
+            wr(A2W_PLLA_FRAC, frac);
+        }
+        return;
+    }
     ctrl = (ctrl & ~NDIV_MASK) | ndiv;
     if (tgt < cur) {
         wr(A2W_PLLA_CTRL, ctrl);
+        wr(A2W_PLLA_FRAC, frac);
+    } else {
+        wr(A2W_PLLA_FRAC, frac);
+        wr(A2W_PLLA_CTRL, ctrl);
     }
-    wr(A2W_PLLA_FRAC, frac);
-    wr(A2W_PLLA_CTRL, ctrl);
 }
 
 // The row's multiplier (NDIV.FRAC, 20 fractional bits) scaled by trim_ppb, rounded to one FRAC step.
+// The integer row is never trimmed: just off an integer the PLL adds spurs, and crossing it is a jump.
 static uint32_t trimmed(const row_t *r) {
     int64_t base = (int64_t)r->ndiv << 20 | r->frac;
+    if (r->frac == 0) {
+        return (uint32_t)base;
+    }
     int64_t d = base * trim_ppb;
     return (uint32_t)(base + (d >= 0 ? d + 500000000 : d - 500000000) / 1000000000);
 }
@@ -256,8 +271,9 @@ bool pll_out_select(uint32_t row) {
     return st.state == PLL_LOCKED;
 }
 
-// Phase 5: a live trim, FRAC (and NDIV when the fraction carries) only, with no hold, so the channel and
-// the SMI keep running. One FRAC step is about 0.016 ppm on the A rows and 0.02 ppm on the B rows.
+// Phase 5: a live trim, FRAC only, with no hold, so the channel and the SMI keep running. One FRAC step
+// is about 0.016 ppm on the A rows, 0.017 ppm on C48 and 0.022 ppm on B44. On the integer row the trim
+// waits for the SMI to move to C48 (pll_out_reselect()).
 void pll_out_trim(int32_t ppb) {
     trim_ppb = ppb;
     st.trim_ppb = ppb;
@@ -323,18 +339,33 @@ void pll_out_sabotage(uint32_t ms) {
     sabotage_until = ms ? sabotage_last + ms * 1000u : 0;
 }
 
+// True when the 48 kHz family must not run from the integer row.
+static bool fractional(void) {
+    return tracked || trim_ppb != 0;
+}
+
 uint32_t pll_out_smi_row(uint32_t freq, uint32_t *divi) {
-    // Option B: plla_per is 7680 fs at 48 or 44.1 kHz, and the SMI takes 768 fs.
+    // Option B: plla_per is 7680 fs at 48 or 44.1 kHz, or 9216 fs on C48, and the SMI takes 768 fs.
     uint32_t base = freq == 0 ? 0 : freq % 11025u == 0 ? 44100u : freq % 8000u == 0 ? 48000u : 0;
-    if (base == 0 || (10u * base) % freq) {
+    uint32_t row = base != 48000u ? PLL_ROW_B44 : fractional() ? PLL_ROW_C48 : PLL_ROW_B48;
+    uint32_t mult = row == PLL_ROW_C48 ? 12u : 10u;
+    if (base == 0 || (mult * base) % freq) {
         return PLL_ROW_COUNT;
     }
-    uint32_t d = 10u * base / freq;
+    uint32_t d = mult * base / freq;
     if (d < 1u || d > 15u) {
         return PLL_ROW_COUNT;   // CM_SMI has 4 integer bits
     }
     *divi = d;
-    return base == 48000u ? PLL_ROW_B48 : PLL_ROW_B44;
+    return row;
+}
+
+void pll_out_set_tracked(bool on) {
+    tracked = on;
+}
+
+bool pll_out_reselect(void) {
+    return in_use && active == &rows[fractional() ? PLL_ROW_B48 : PLL_ROW_C48];
 }
 
 void pll_out_set_in_use(bool on) {

@@ -1157,7 +1157,7 @@ So the final image is clean at 96 kHz because its layout happens to stall rarely
 
 **The hangs, and the DMA abort.** The board stopped answering twice during the audit, each time straight after the input source went from I2S back to USB. It stayed enumerated, timed out every control request and needed a power cycle. The first time was on an image with the experiments in it, the second on the plain build. `stop()` reset the capture channel while it was mid-transfer, and both hangs came on images with the wide bursts. Every reset of a channel that may be active now pauses it first, waits for its outstanding writes (CS bit 6) and only then resets, as Linux's `bcm2835_dma_abort()` does. With that, 170 switches from I2S back to USB passed with no hang, 40 of them on the final image: master and ext roles at the three rates, with rate changes while the input ran, and 53 of them with MCK on. The hang was not reproduced on purpose without the change, since each try needs a power cycle, so the abort is the likely cure and not a proven one.
 
-**Follower at a master that is exactly nominal.** With the bench master at exactly 48000 Hz the follower never locked (8 tries of 8): the lag swung between -57 and +107 ns and the trim between -0.4 and +16 ppm. At 48001 Hz and at 48002 Hz it locked at once, as it did at exactly 44100 and 96000 Hz. The 48 kHz PLLA row has a fraction of zero, so a trim that crosses zero changes NDIV and FRAC in two writes (`write_multiplier()` in `pll_out.c`), and the clock jumps between them. A master within a few tenths of a ppm of the Pi's own crystal at 48 kHz would do the same. This is in the PLL code, which the S/PDIF input's servo also uses, and was not changed.
+**Follower at a master that is exactly nominal.** With the bench master at exactly 48000 Hz the follower never locked (8 tries of 8): the lag swung between -57 and +107 ns and the trim between -0.4 and +16 ppm. At 48001 Hz and at 48002 Hz it locked at once, as it did at exactly 44100 and 96000 Hz. The 48 kHz PLLA row has a fraction of zero, so a trim that crosses zero changes NDIV and FRAC in two writes (`write_multiplier()` in `pll_out.c`), and the clock jumps between them. A master within a few tenths of a ppm of the Pi's own crystal at 48 kHz would do the same. This is in the PLL code, which the S/PDIF input's servo also uses, and was not changed. Fixed in section 32.
 
 **Fixed in the audit.**
 - With an external master, the main loop delivered input blocks as soon as DSPi's rate detection locked, about 340 ms before the clock follower. Those blocks ran `preset_loading` out, so the prefill handshake never ran: the outputs were never restarted together and the DAC hardware mute was never released. The lock-gated poll now waits for the follower too. Checked on the board with the DAC hardware mute enabled on GPIO 17: in the ext, master and loop cases the outputs were drained once and started together once, the mute was released, and the follower kept its lock. Every run of the tool now checks the drain and the start.
@@ -1251,7 +1251,84 @@ In slave mode DSPi measures the wire rate from how fast the ring's write index a
 | 44.1 kHz | master | 105.8 M | 0 | 0 | 0 | 0 | 0 | 6.30% |
 | 44.1 kHz | slave (switched live) | 105.8 M | 0 | 0 | 0 | 0 | 0 | 6.31% |
 
-- **48 kHz slave mode fails, from PLLA, not from the input.** The 48 kHz row is integer-N (NDIV 48, FRAC 0). A trim crossing zero rewrites NDIV and FRAC in two writes (`pll_out.c` `write_multiplier()`), and the clock jumps between them. In the loopback the servo chases its own output, so its trim sits at zero: 8 to 21 lock losses a minute. With 48 kHz moved to the fractional row (A48) for a test, 30 s of slave mode were clean. This is the I2S follower's failure to lock to a master at exactly 48000 Hz (section 30, finding 5). Not changed here.
+- **48 kHz slave mode fails, from PLLA, not from the input.** The 48 kHz row is integer-N (NDIV 48, FRAC 0). A trim crossing zero rewrites NDIV and FRAC in two writes (`pll_out.c` `write_multiplier()`), and the clock jumps between them. In the loopback the servo chases its own output, so its trim sits at zero: 8 to 21 lock losses a minute. With 48 kHz moved to the fractional row (A48) for a test, 30 s of slave mode were clean. This is the I2S follower's failure to lock to a master at exactly 48000 Hz (section 30, finding 5). Not changed here. Fixed in section 32.
 - **A loopback must start at its own rate.** A rate change on the switch to ADAT holds the outputs, the ADAT output among them, until the input locks, and a loopback's input can only lock to that output. The tool sets the Pi's USB rate first by playing to it directly.
 - With the input running, the whole core is at 16.7% at 48 kHz with the generator on. The idle load is unchanged, 0.92 to 0.99% against 0.88 to 0.89% for the image before this work.
 - `smi_check.py`, `spdif_cs_check.py`, `mck_check.py`, `adat_check.py --watch 20` and `i2s_input_check.py` (loop, master and ext at 48 kHz, 15 s) passed. **The S/PDIF input was not rechecked** on hardware after its capture moved to `pcm_capture_pi.c`, since `spdif_in_check.py` needs GPIO 20 on an S/PDIF signal (a source, or the GPIO 8 jumper) instead of the ADAT loopback. `adat_check.py` failed once ("ADAT channel 1 differs from slot 0") and passed three times after, as section 30 saw before ADAT input existed.
+
+## 32. PLLA while it is trimmed: a second 48 kHz row
+
+The 48 kHz family ran from PLLA's integer row (B48, NDIV 48, FRAC 0) in every mode. That row is right while nothing trims PLLA, and wrong as soon as something does: a trim that crosses zero has to change NDIV, and a trim that stays just off zero leaves the PLL a hair from an integer. The 48 kHz family now has a second row for the trimmed case, and the integer row is never trimmed.
+
+### What was measured first
+
+**How close a source must be before the trim crosses zero.** The spread of the trim in locked runs:
+
+| Loop | Rate | Trim, least to most | Spread |
+|---|---|---|---|
+| I2S clock follower, bench master +21 ppm | 48 kHz | +20.434 to +20.607 ppm | 0.17 ppm |
+| I2S clock follower, bench master -21 ppm | 48 kHz | -21.574 to -21.372 ppm | 0.20 ppm |
+| I2S clock follower, bench master nominal | 44.1 kHz | -0.660 to -0.485 ppm | 0.18 ppm |
+| I2S clock follower, bench master nominal | 96 kHz | +0.965 to +1.061 ppm | 0.10 ppm |
+| DSPi's servo, ADAT slave on its own output | 48 kHz | +2.813 to +6.574 ppm | 3.8 ppm |
+| DSPi's servo, ADAT slave on its own output | 44.1 kHz | -7.693 to -0.637 ppm | 7.1 ppm |
+
+The follower runs were 60 s and the servo runs 120 s (read 40 times a second). So the follower's trim crosses zero once a master is within about 0.1 ppm of the Pi's crystal, and DSPi's servo within a few ppm, which covers most crystal sources at some temperature. The bench master runs from the Pi's own crystal, so a real master adds its own drift to the follower's figure. The loopback is a servo chasing itself, so its figure is an upper estimate for a real source. The bench master's "nominal" is also not exact: its PLLD divider rounds, which is the -0.5 ppm at 48 kHz and +1.0 ppm at 96 kHz. The follower failed at exactly 48000 Hz (section 30) because it starts from a trim of zero, on the crossing itself.
+
+**FRAC is not latched by the CTRL write.** On B48, writing FRAC alone (0x1000) moved the SMI clock by +81.38 ppm at once, and rewriting CTRL changed nothing more. Writing NDIV alone (47) moved it by -20833 ppm. Each register takes effect as it is written, so no order of writes makes a move that changes NDIV safe. Masking interrupts around the two writes did not help either (below).
+
+**Jitter that the board can measure.** For these tests only, the PCM block's 125 MHz capture (`pcm_capture_pi.c`) sampled the ADAT output on GPIO 20 while it carried silence. Each edge's phase against the nominal bit clock was averaged over 125 us blocks, for 8 s a capture. That gives the phase of the output clock against PLLD from 5 Hz to 4 kHz. A tone at a known frequency shows from about 0.3 ps rms. The broadband figure, 24 to 37 ps rms in total, is mostly the beat of the edge grid against the 8 ns sampling grid, which depends only on the clock's rate, so rows are compared at the same trim. This code was removed after the tests. Jitter above 4 kHz is not measured.
+
+- **A crossing.** With the trim toggled between +0.02 and -0.02 ppm twenty times a second on B48, the output's phase jumped by up to 8.8 ns at a crossing, 290 jumps of more than 200 ps in 8 s. With interrupts masked around the writes it was 8.9 ns and 279 jumps. With both trims on the same side of zero there were none, and none on a fractional row.
+- **Just off the integer.** A trimmed B48 carries a comb of tones at FRAC x 18.31 Hz (19.2 MHz / 2^20) and its multiples, inside the audio band, where no PLL in a DAC or a receiver filters them:
+
+| Row and trim | Beat | Tones at the beat and its multiples (ps rms) | Same frequencies on the fractional rows |
+|---|---|---|---|
+| B48 +0.3 ppm (FRAC 15) | 274.7 Hz | 3.6, 13.4, 3.6, 9.3, 2.5, 5.8, 1.6, 3.7 | not captured at this trim |
+| B48 +1 ppm (FRAC 50) | 915.5 Hz | 3.4, 12.3, 3.2, 6.5 | 0.15 to 0.44 |
+| B48 -1 ppm (NDIV 47, FRAC -50) | 915.5 Hz | 3.6, 12.1, 3.0, 6.5 | |
+| B48 +3 ppm (FRAC 151) | 2764.9 Hz | 2.7 | |
+
+  That is about 15 to 19 ps rms of discrete tones that the fractional rows do not have. At +20 ppm the comb is above the band and folds back as 15 ps more noise from 1 to 4 kHz than the fractional rows show at the same trim.
+- **Fractional rows against each other.** A48 (N 61.44), C48 (N 57.6) and a row at N 38.4 read the same at trims of 0, +1 and +20 ppm, within 3 ps. So did B44, A44 and two more 44.1 kHz rows (N 52.92 and 35.28). The 44.1 kHz row was left as it is.
+- **Integer against fractional, untrimmed.** With a block length that does not favour the exact ratio, B48 read 12.5 and 21.7 ps (100 Hz to 1 kHz, 1 to 3.8 kHz), A48 12.5 and 21.9, C48 12.6 and 21.9. The board cannot tell them apart in this band. The integer row's advantage, no sigma-delta modulation in the PLL at all, is above what this method sees, so it rests on theory.
+
+### The change
+
+- **Row C48.** VCO 2211.84 MHz (NDIV 57, FRAC 0x9999A, N = 57.6), PER /5 = 442.368 MHz, CM_SMI /12 at 48 kHz and /6 at 96 kHz, MCK /36 and /72 (/18 and /36 at 96 kHz), all integers. Its fraction is 0.6, so its sigma-delta beat is at 7.7 MHz and the full trim range (0.03% of N) stays far from an integer. One FRAC step is 0.017 ppm.
+- **Which row.** `pll_out_smi_row()` gives C48 for the 48 kHz family while an input owns the trim or the trim is not zero, and B48 otherwise. An input owns the trim while the source is S/PDIF, or ADAT or I2S in slave mode (`soft_vcxo_pi_tracking()`), whatever the trim is at that moment, so the row does not change while a servo passes through zero. The bench trim moves to C48 by being non-zero. 44.1 kHz stays on B44 in every mode.
+- **The move.** B48, B44 and C48 share the PER divider, so every move between them is live, as a family change already was. The main loop sees that the SMI runs from the other 48 kHz row (`pll_out_reselect()`) and sets the clock up again (`smi_out_reclock()`), which is the rate change path: PLLA slews, and CM_SMI and MCK take their new dividers.
+- **Trims.** The integer row is never trimmed (`trimmed()`), and a trim writes FRAC only. A write that would change nothing is skipped, and CTRL is written only when NDIV changes, now that FRAC is known to be live.
+- **Why not the A rows for the trimmed case.** They read the same, but their PER divider is /8, so entering and leaving slave mode would hold the PER channel and wait for lock with the SMI parked on PLLD. C48 costs one live move.
+- **Why not a fractional row always.** It would be simpler and the board cannot measure the difference, but it gives up the integer row in master mode, where it costs nothing to keep.
+
+### What it costs
+
+At 48 and 96 kHz, entering or leaving a mode in which an input owns the clock moves PLLA between B48 and C48. The clock manager's counter shows the SMI clock short by 63 ppm in the millisecond of the move and exact from the next. DSPi restarts the outputs on those changes anyway. One effect was seen: an ADAT input looped to the board's own output loses lock once on the live switch to slave mode at 48 kHz (it does not at 44.1 kHz, where no row changes), then relocks and stays locked. Nothing changes at 44.1 kHz or in master mode.
+
+### Results
+
+All on the final image, which has no test code in it.
+
+| Run | Result |
+|---|---|
+| `adat_input_check.py --rates 48000,44100 --seconds 300`, 48 kHz master | 115.2 M samples, 0 wrong, 0 header errors, 0 lock losses |
+| the same, 48 kHz slave (switched live) | 115.2 M samples, 0 wrong, 0 header errors, 0 lock losses (was 8 to 21 losses a minute) |
+| the same, 44.1 kHz master and slave | 105.8 M samples each, 0 wrong, 0 header errors, 0 lock losses |
+| `i2s_input_check.py`, loop, master and ext (44.1 kHz +40 ppm) | pass |
+| ext, master at exactly 48000 Hz, 60 s twice and 300 s | locked in 0.5 s, 0 unlocks, 28.8 M samples in the 300 s with none wrong, lag within -1.24 to +1.17 ns, trim -0.62 to -0.38 ppm (never locked before) |
+| ext, exactly 96000 Hz and 44100 Hz, 60 s | pass, trims +0.96 to +1.05 and -0.67 to -0.47 ppm |
+| ext, 48000 Hz +21 ppm and 96000 Hz -21 ppm, 60 s | pass |
+| ext with the master's rate changed live, 48, 96, 44.1, 48, 44.1, 96, 48 kHz | every step locked in 0.6 to 0.7 s on rows C48, C48, B44, with no unlocks and no wrong samples |
+| bench trim on the final image, 48 kHz | 0 on B48 (SMI /10), any other trim on C48 (SMI /12), +0.02 and -0.02 ppm one FRAC step apart, back to B48 at 0 |
+| `pll_trim.py`, 48 and 44.1 kHz | steps, the staircase to +/-100 ppm and the jump all within the counter's resolution, no lost lock, stream clean |
+| watchdog on C48 (trim +5 ppm, PLLA rewritten behind it) | restored to C48 with its trim within the second; `pll_failover.py` passes on B48 |
+| `pll_settle.py --rows 5` (B48 to C48, and B44 to C48) | within one count from the second 1 ms window |
+| `pll_check.py --rows a48,a44,b48,b44,c48` (SMI on PLLD) | every row locks and counts exactly |
+| `smi_check.py` at 48, 44.1, 96 and 48 kHz, `spdif_cs_check.py`, `mck_check.py`, `adat_check.py --watch 20`, `output_toggle_check.py`, `spdif_in_check.py` (no source), `smi_pll_check.py`, `uac2_stream_check.py 3` | pass |
+| `pll_soak.py --minutes 6` (a rate switch every minute) | no underruns, drops or late compositions in any minute, the SMI on PLLA and exact, no watchdog event |
+| `usb_health.py` | no hang recoveries, no wait timeouts |
+| idle load on a fresh boot, 48 kHz | 0.89 to 0.97%, unchanged |
+
+**Not verified.** The S/PDIF input's servo on a real S/PDIF signal (there is no source on the bench; the path is the one ADAT slave mode uses, and the source switch to S/PDIF and back was checked with nothing connected). DSPi's servo against a real ADAT source, where the trim would sit near zero for long periods, since the loopback's trim wanders a few ppm. A rate change of the wire while in ADAT slave mode, which a loopback cannot make. Jitter above 4 kHz, and the waveform on any pin.
+

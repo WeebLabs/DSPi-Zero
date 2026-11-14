@@ -308,6 +308,10 @@ void smi_out_set_rate(uint32_t freq) {
     irq_global_restore(save);
 }
 
+void smi_out_reclock(void) {
+    smi_out_set_rate(st.freq);
+}
+
 void smi_out_set_source(uint32_t src) {
     uint32_t divi, row = pll_out_smi_row(st.freq, &divi);
     if (src == SMI_SRC_PLLA && row < PLL_ROW_COUNT) {

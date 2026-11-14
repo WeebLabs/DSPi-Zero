@@ -1349,6 +1349,10 @@ int main(void) {
         pll_out_poll();
         pcm_rx_poll();
         i2s_input_pi_poll();
+        pll_out_set_tracked(soft_vcxo_pi_tracking());
+        if (pll_out_reselect()) {
+            smi_out_reclock();      // 48 kHz moves between the integer row and C48 as trimming starts or stops
+        }
         if (pll_out_watchdog() == PLL_WD_FALLBACK) {
             smi_out_set_source(SMI_SRC_PLLD);   // PLLA keeps being rewritten: stay on PLLD until reboot
         }
